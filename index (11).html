@@ -1,0 +1,1367 @@
+<!doctype html>
+<html lang="ka"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        const RealString = String;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that a throw here leaves the bridge laid.
+        // As join(' ') words each argument, but for a Symbol or an object with no toString, at which join throws in the page's own call.
+        const worded = (arg) => {
+          try {
+            return RealString(arg ?? '');
+          } catch {
+            return '[object Object]';
+          }
+        };
+        [['log', ''], ['error', 'Error: '], ['warn', 'Warning: ']].forEach(([method, prefix]) => {
+          if (typeof window.console?.[method] !== 'function') return;
+          const native = window.console[method].bind(window.console);
+          window.console[method] = (...args) => {
+            native(...args);
+            realParent.postMessage({ type: 'console', message: prefix + args.map(worded).join(' ') }, '*');
+          };
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "d5f2c778-3227-4823-a5d7-6805e6285c82" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script><meta charset="utf-8"><title>ვიდეო კონტენტის ანალიტიკა 2026</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Georgian:wght@400;600;700&amp;display=swap" rel="stylesheet">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#f4f6fa;--cd:#fff;--tx:#0f172a;--mu:#64748b;--bd:#e2e8f0;--sg:#f1f5f9;--ac:#f59e0b;--pri:#0f172a;--prt:#fff;--up:#059669;--dn:#dc2626;--r:16px;--sh:0 1px 2px rgba(15,23,42,.05),0 10px 24px -14px rgba(15,23,42,.14)}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0b1120;--cd:#111a2e;--tx:#e8edf7;--mu:#8a96ad;--bd:#1f2a44;--sg:#17213a;--pri:#f59e0b;--prt:#0b1120;--sh:none}}
+:root[data-theme=dark]{--bg:#0b1120;--cd:#111a2e;--tx:#e8edf7;--mu:#8a96ad;--bd:#1f2a44;--sg:#17213a;--pri:#f59e0b;--prt:#0b1120;--sh:none}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.55 'Noto Sans Georgian',system-ui,sans-serif;-webkit-text-size-adjust:100%;letter-spacing:-.005em}
+.app{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:100vh}
+#nav{position:sticky;top:0;height:100vh;background:#0f172a;color:#cbd5e1;display:flex;flex-direction:column;padding:22px 14px}
+.br{display:flex;gap:12px;align-items:center;padding:4px 8px 26px;color:#fff}.br b{display:block;font-size:15px}.br small{color:#94a3b8;font-size:11px}.lg{width:40px;height:40px;border-radius:12px;background:var(--ac);color:#0f172a;display:grid;place-items:center;font-weight:800;font-size:18px}
+#nav nav{display:flex;flex-direction:column;gap:4px;flex:1}
+.ni{display:flex;align-items:center;gap:12px;background:none;border:0;box-shadow:none;color:#cbd5e1;padding:11px 12px;border-radius:12px;text-align:left;font-weight:500;width:100%;cursor:pointer}.ni:hover{background:rgba(255,255,255,.07);border:0}.ni.on{background:rgba(245,158,11,.16);color:#fbbf24}.ni.cp{margin-top:auto;border-top:1px solid #1e293b;border-radius:0 0 12px 12px}.l2{display:none}
+main.w{padding:30px 34px 110px;max-width:1220px;width:100%}
+#ph h1{font-size:26px;margin:0;letter-spacing:-.03em;line-height:1.2}#ph p{margin:4px 0 22px;color:var(--mu)}h2{font-size:15px;margin:0 0 14px;font-weight:600}
+.sub{color:var(--mu);font-size:12px}.sh{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap}.sh h2{margin:0}.sh p{margin:2px 0 0;color:var(--mu);font-size:12px}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--cd);border:1px solid var(--bd);border-radius:12px;padding:8px 14px;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:6px}button:hover{border-color:var(--mu)}button:active{transform:scale(.97)}
+button.pr{background:var(--pri);border-color:var(--pri);color:var(--prt);font-weight:600}button.x{color:var(--dn)}.ib{padding:7px;border-radius:10px}
+select,input{background:var(--cd);border:1px solid var(--bd);border-radius:12px;padding:9px 12px;max-width:100%}select:focus,input:focus{outline:2px solid var(--ac);outline-offset:-1px}input.nm{font-weight:600;font-size:15px;min-width:240px}
+.fl{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center}.fb{background:var(--cd);border:1px solid var(--bd);border-radius:var(--r);padding:10px;box-shadow:var(--sh)}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:16px}
+.k{background:var(--cd);border:1px solid var(--bd);border-radius:var(--r);padding:16px;cursor:pointer;transition:.15s;box-shadow:var(--sh)}.k:hover{border-color:var(--mu)}.k.on{background:var(--pri);color:var(--prt);border-color:var(--pri)}
+.k b{display:block;font-size:28px;line-height:1.15;margin:6px 0 2px;letter-spacing:-.04em}.k span{color:var(--mu);font-size:12px;font-weight:500}.k.on span{color:var(--prt);opacity:.75}.k svg{display:block;margin-top:8px;width:100%;height:28px}
+.c{background:var(--cd);border:1px solid var(--bd);border-radius:var(--r);padding:20px;margin-bottom:16px;box-shadow:var(--sh)}
+.ov{overflow-x:auto;-webkit-overflow-scrolling:touch}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{padding:11px 12px;border-bottom:1px solid var(--bd);text-align:right}
+tr:last-child td{border-bottom:0}tr:hover td{background:var(--sg)}th:first-child,td:first-child{text-align:left;position:sticky;left:0;background:var(--cd);z-index:1}
+th{color:var(--mu);font-weight:600;cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:var(--sg)}th:first-child{background:var(--sg)}td.t{max-width:300px;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.up{color:var(--up);font-weight:600}.dn{color:var(--dn);font-weight:600}a{color:var(--tx)}.chip{display:inline-flex;gap:8px;align-items:center;background:var(--sg);border:1px solid var(--bd);border-radius:99px;padding:4px 6px 4px 14px;margin:3px}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}.cols .c{margin:0}
+.cc{position:relative;display:flex;align-items:flex-end;gap:8px;height:280px;padding:24px 0 28px 40px;margin-top:6px}
+.ax{position:absolute;left:0;right:0;top:24px;bottom:28px;pointer-events:none}.ax i{position:absolute;left:0;right:0;border-top:1px dashed var(--bd)}.ax i b{position:absolute;left:0;top:-8px;font-size:10px;color:var(--mu);font-weight:500;background:var(--cd);padding-right:6px}
+.cl{position:relative;z-index:1;flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;cursor:pointer}
+.cb{position:relative;width:100%;max-width:48px;height:calc(var(--p)*1%);min-height:3px;border-radius:9px 9px 3px 3px;background:linear-gradient(180deg,#fbbf24,#f59e0b);transition:.2s}
+.cv{position:absolute;left:50%;transform:translateX(-50%);top:-18px;font-size:11px;font-weight:600;white-space:nowrap}
+.cm{position:absolute;bottom:-24px;font-size:11px;color:var(--mu);font-weight:500}
+.cc:hover .cl:not(:hover) .cb{opacity:.5}.cl:hover .cb{filter:brightness(1.07)}.cl.sl .cb{background:var(--pri)}
+.tt{position:absolute;bottom:calc(var(--p)*1% + 26px);left:50%;transform:translate(-50%,6px);opacity:0;pointer-events:none;transition:.15s;background:var(--pri);color:var(--prt);border-radius:12px;padding:10px 14px;white-space:nowrap;z-index:6;font-size:12px;line-height:1.55;box-shadow:0 10px 30px rgba(2,6,23,.3)}
+.tt .tv{font-size:18px;font-weight:700;letter-spacing:-.02em}.tt .sub2{opacity:.7}
+.cl:hover .tt,.cl.sl .tt{opacity:1;transform:translate(-50%,0)}.cc:hover .cl.sl:not(:hover) .tt{opacity:0}
+.cl:nth-child(-n+2) .tt{left:0;transform:translate(0,6px)}.cl:nth-child(-n+2):hover .tt,.cl.sl:nth-child(-n+2) .tt{transform:none}
+.cl:nth-child(n+11) .tt{left:auto;right:0;transform:translate(0,6px)}.cl:nth-child(n+11):hover .tt,.cl.sl:nth-child(n+11) .tt{transform:none}
+@media(max-width:860px){.cc{height:230px;gap:3px;padding-left:30px}.cv{font-size:9px;top:-15px}.cm{font-size:9.5px}.ax i b{font-size:9px}.tt{font-size:11px;padding:8px 10px}.tt .tv{font-size:15px}}
+.vx .cl .tt{left:50%;right:auto;transform:translate(-50%,6px);white-space:normal;width:240px}.vx .cl:hover .tt,.vx .cl.sl .tt{transform:translate(-50%,0)}
+.vx .cl.ed1 .tt{left:0;transform:translate(0,6px)}.vx .cl.ed1:hover .tt,.vx .cl.ed1.sl .tt{transform:none}.vx .cl.ed2 .tt{left:auto;right:0;transform:translate(0,6px)}.vx .cl.ed2:hover .tt,.vx .cl.ed2.sl .tt{transform:none}
+.vx .cb{max-width:34px}.vx .cl.sl .tt{opacity:1}.vx{gap:5px}
+@media(max-width:860px){.vw{overflow-x:auto;-webkit-overflow-scrolling:touch}.vx{min-width:calc(var(--n)*30px)}.vx .tt{display:none}}
+.qx{gap:14px;padding-top:46px}.qx .cb{max-width:110px}.qx .cv{text-align:center;line-height:1.3;top:-36px;font-size:13px}.qx .cv small{font-size:11px;font-weight:600}.qx .cm{font-size:12px}
+.qx .tt{width:auto;white-space:nowrap;bottom:calc(var(--p)*1% + 56px)}.qx .cl.sl .tt{opacity:0}.qx .cl.sl:hover .tt{opacity:1}
+@media(max-width:860px){.qx{gap:8px;padding-left:34px}.qx .cv{font-size:11px;top:-34px}.qx .cm{font-size:10px}}
+.md .fh{margin:18px 0 0;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mu);border-bottom:1px solid var(--bd);padding-bottom:6px;font-weight:600}.fr{display:flex;flex-wrap:wrap;gap:0 12px}.fi{flex:1 1 100%}.fi.half{flex:1 1 calc(50% - 6px);min-width:0}
+.vx:not(.qx){padding-bottom:78px;height:330px}.vx:not(.qx) .ax{bottom:78px}@media(max-width:860px){.vx:not(.qx){height:290px}}.vx:not(.qx) .cm{bottom:auto;top:calc(100% + 6px);writing-mode:vertical-rl;max-height:68px;overflow:hidden;white-space:nowrap;font-size:11px;color:var(--tx);font-weight:600}
+.qs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.qt{background:var(--sg);border-radius:14px;padding:10px 12px 12px;cursor:pointer;transition:.15s;min-width:0}.qt:hover{transform:translateY(-2px)}
+.qh{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:11px;color:var(--mu);font-weight:600}.qh em{font-style:normal;font-weight:700}
+.qt b{display:block;font-size:19px;letter-spacing:-.03em;margin:4px 0 8px;white-space:nowrap}
+.qb{height:5px;border-radius:99px;background:var(--bd);overflow:hidden}.qb i{display:block;height:100%;border-radius:99px;background:#6366f1}
+.qt.sl{background:var(--pri);color:var(--prt)}.qt.sl .qh,.qt.sl .qh em{color:inherit}.qt.sl .qh{opacity:.8}.qt.sl .qb{background:rgba(128,128,128,.35)}.qt.sl .qb i{background:var(--ac)}
+.qs.cp .qt{padding:8px 9px 10px}.qs.cp b{font-size:15px;margin:3px 0 6px}.qs.cp .qh span{font-size:10px}
+@media(max-width:860px){.qs:not(.cp){grid-template-columns:1fr 1fr}.qs.cp .qh em{display:none}}
+.tr{height:96px;margin:0 0 14px}.tr svg{width:100%;height:100%;display:block}
+.mt{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.mc{position:relative;overflow:hidden;background:var(--sg);border-radius:14px;padding:10px 10px 13px;cursor:pointer;display:flex;flex-direction:column;gap:1px;transition:.15s;min-width:0}.mc:hover{transform:translateY(-2px)}
+.mc span{font-size:11px;color:var(--mu);font-weight:600}.mc b{font-size:16px;letter-spacing:-.03em;white-space:nowrap}.mc em{font-style:normal;font-size:11px;min-height:16px;font-weight:600}
+.mc i{position:absolute;left:0;bottom:0;height:3px;background:var(--ac);border-radius:0 3px 0 0}
+.mc.tp{background:rgba(245,158,11,.16)}.mc.sl{background:var(--pri);color:var(--prt)}.mc.sl span{color:var(--prt);opacity:.7}.mc.z{opacity:.5}.mc.dim{opacity:.45}
+.md{position:fixed;inset:0;background:rgba(2,6,23,.5);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:16px;z-index:30}.md>div{background:var(--cd);border-radius:22px;padding:24px;width:100%;max-width:480px;max-height:92%;overflow:auto}
+.md label{display:block;margin:10px 0 3px;font-size:12px;color:var(--mu)}.md input,.md select{width:100%}
+#bar{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom,0px));width:min(520px,calc(100% - 24px));display:flex;gap:10px;align-items:center;justify-content:space-between;background:var(--pri);color:var(--prt);padding:9px 9px 9px 20px;border-radius:99px;z-index:25;box-shadow:0 12px 40px rgba(2,6,23,.35)}#bar[hidden]{display:none}#bar button{background:var(--ac);color:#0f172a;border:0;border-radius:99px;font-weight:700}
+.gi input{width:72px;padding:5px 7px;text-align:right}
+.dt{display:block}.mb{display:none}.vc{border-bottom:1px solid var(--bd);padding:14px 0}.vc:last-child{border:0}.vt{font-weight:600}
+.vs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0;text-align:center}.vs div{background:var(--sg);border-radius:12px;padding:8px 2px;font-size:11px;color:var(--mu)}.vs b{display:block;font-size:15px;color:var(--tx)}
+.va{display:flex;gap:8px;align-items:center}.va a{background:var(--ac);color:#0f172a;font-weight:700;text-decoration:none;padding:8px 16px;border-radius:12px}
+@media(max-width:860px){.app{display:block}#nav{position:fixed;left:0;right:0;bottom:0;top:auto;height:auto;flex-direction:row;padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));z-index:20;border-top:1px solid #1e293b}.br{display:none}#nav nav{flex-direction:row;gap:0;justify-content:space-around}
+.ni{flex-direction:column;gap:3px;font-size:10.5px;padding:7px 2px;flex:1;text-align:center;justify-content:center}.ni.cp{margin:0;border:0;border-radius:12px}.l1{display:none}.l2{display:inline}
+main.w{padding:16px 14px 120px}#ph h1{font-size:21px}#ph p{margin-bottom:16px;font-size:13px}#bar{bottom:calc(84px + env(safe-area-inset-bottom,0px))}
+.g{grid-template-columns:1fr 1fr;gap:10px}.k{padding:12px}.k b{font-size:21px}.c{padding:14px;border-radius:14px}.cols{grid-template-columns:1fr}
+select,input{font-size:16px}.fl select{flex:1 1 45%}.fl input{flex:1 1 100%}input.nm{min-width:0;flex:1}.dt{display:none}.mb{display:block}
+.mt{grid-template-columns:repeat(3,1fr);gap:6px}.mc{padding:9px 8px 12px}.mc b{font-size:15px}.tr{height:70px}
+.md{align-items:flex-end;padding:0}.md>div{max-width:none;border-radius:22px 22px 0 0;padding-bottom:calc(24px + env(safe-area-inset-bottom,0px))}}
+</style></head><body id="artifacts-component-root-html"><div class="app"><aside id="nav"></aside><main class="w"><div id="ph"></div><div id="app"></div></main></div><div id="bar" hidden=""><span id="bt"></span><button class="pr" id="bb" onclick="pub()"></button></div><div id="mdl"></div>
+<script id="seed" type="application/json">{"companies":[{"id":"c1791875754866","name":"ალფა სახლი","monthly":{"views":[0,0,0,0,0,0,0,0,0,0,0,0],"eng":[0,0,0,0,0,0,0,0,0,0,0,0],"videos":[0,0,0,0,0,0,0,0,0,0,0,0],"followers":[0,0,0,0,0,0,0,0,0,0,0,0],"leads":[0,0,0,0,0,0,0,0,0,0,0,0]}},{"id":"c1792582168784","name":"ლემონს გრუპი","monthly":{}},{"id":"c1793016823827","name":"სოლუმ დეველოპმენტი","monthly":{}},{"id":"c1793084740964","name":"ალფა შეკვეთილი","monthly":{}},{"id":"c1793085242977","name":"ველარეა დეველოპმენტი","monthly":{}},{"id":"c1793086154020","name":"UX დეველოპმენტი","monthly":{}}],"creators":["AI","ანანო","ალფიკო AI","მ. მეცხოვრიშვილი","საბა","ავთო","თაკო იურისტი","გრეტა","სოლა AI","ატია","ხატია პაიჭაძე"],"videos":[{"id":"v1791884687137","t":"შეიძინე ბინა 24 კვ.მ-დან","co":"c1791875754866","cr":"ალფიკო AI","m":0,"v":492552,"e":392,"c":18,"w":9,"l":"https://www.facebook.com/reel/874880161815339","n":""},{"id":"v1791884818506","t":"შეიძინე ბინა - თვეში 550 ლარად!","co":"c1791875754866","cr":"AI","m":0,"v":40039,"e":123,"c":18,"w":7,"l":"https://www.facebook.com/reel/1536904250931546","n":""},{"id":"v1791884911355","t":"ბინა დიდ დიღომში, კვ.მ 905$-ად!","co":"c1791875754866","cr":"AI","m":0,"v":58511,"e":148,"c":4,"w":6,"l":"https://www.facebook.com/reel/887843414421465","n":""},{"id":"v1791884980237","t":"თუ საკუთარი ჭერის შეძენას ფიქრობ","co":"c1791875754866","cr":"ანანო","m":0,"v":61400,"e":315,"c":41,"w":7,"l":"https://facebook.com/reel/2206304343198333/","n":""},{"id":"v1791885043425","t":"ბინა დიდ დიღომში, კვ.მ 905$","co":"c1791875754866","cr":"ანანო","m":0,"v":19721,"e":126,"c":19,"w":6,"l":"https://www.facebook.com/reel/1637565500944349","n":""},{"id":"v1791885326402","t":"სახლში დაბრუნების ყოველი წამი","co":"c1791875754866","cr":"AI","m":0,"v":28060,"e":60,"c":7,"w":6,"l":"https://fb.watch/KdKk0E_NZ3/","n":""},{"id":"v1791885440272","t":"შენი ბიზნესი იმუშავებს 28 000 მობინადრისთვის","co":"c1791875754866","cr":"AI","m":0,"v":34016,"e":103,"c":12,"w":9,"l":"https://fb.watch/KdKwpRMPCk/","n":""},{"id":"v1791885530209","t":"\"სხვა უბნის\" სხვანაირი კომფორტია","co":"c1791875754866","cr":"AI","m":0,"v":20267,"e":713,"c":12,"w":11,"l":"https://fb.watch/KdKCnLMk1B/","n":""},{"id":"v1791885707367","t":"თვეში მხოლოდ 980 ლარად!","co":"c1791875754866","cr":"AI","m":1,"v":27500,"e":601,"c":14,"w":6,"l":"https://facebook.com/reel/1552349192505625/","n":""},{"id":"v1791885819147","t":"ბინა დიდ დიღომში - კვ.მ. 915$","co":"c1791875754866","cr":"AI","m":1,"v":36837,"e":1187,"c":44,"w":4,"l":"https://www.facebook.com/reel/1210545184605966","n":""},{"id":"v1791885902358","t":"28 000 მობინადრისთვის","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":23857,"e":647,"c":10,"w":3,"l":"https://fb.watch/KdKZzxlhjO/","n":""},{"id":"v1791885985522","t":"შეიძინე ბინა - თვეში 550 ლარად","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":56129,"e":1251,"c":273,"w":4,"l":"https://www.facebook.com/reel/923028720677626","n":""},{"id":"v1791886152191","t":"თვეში მხოლოდ 550 ლარად","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":35101,"e":735,"c":51,"w":3,"l":"https://www.facebook.com/reel/1415617723622612","n":""},{"id":"v1791886388672","t":"თვეში მხოლოდ 550 ლარად","co":"c1791875754866","cr":"AI","m":1,"v":26250,"e":709,"c":68,"w":3,"l":"https://www.facebook.com/reel/25538241172541421","n":""},{"id":"v1791886884499","t":"2 საძინებელი, 66.2 კვ.მ","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":13100,"e":341,"c":16,"w":3,"l":"https://facebook.com/reel/1972136390324973/","n":""},{"id":"v1791887116042","t":"თვეში 550 ლარად","co":"c1791875754866","cr":"AI","m":1,"v":11200,"e":478,"c":13,"w":3,"l":"https://facebook.com/reel/26414561148147807/","n":""},{"id":"v1791887244470","t":"ბინა თვეში 550 ლარად!","co":"c1791875754866","cr":"AI","m":1,"v":17111,"e":438,"c":98,"w":4,"l":"https://www.facebook.com/reel/1457561479320576","n":""},{"id":"v1791887477003","t":"დიდი დიღომი - შენი ახალი მისამართია!","co":"c1791875754866","cr":"AI","m":1,"v":61262,"e":727,"c":20,"w":3,"l":"https://www.facebook.com/reel/1250519636407047","n":""},{"id":"v1791887543474","t":"გაიმარტივე რემონტი - აირჩიე \"სხვა კარკასი\"","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":17943,"e":77,"c":8,"w":8,"l":"https://www.facebook.com/reel/1973990906856916","n":""},{"id":"v1791887646384","t":"გლდანში - თვეში მხოლოდ 550 ლარად!","co":"c1791875754866","cr":"AI","m":1,"v":62845,"e":504,"c":90,"w":6,"l":"https://www.facebook.com/reel/1241802767374807","n":""},{"id":"v1791887727232","t":"სამეზობლოს კომფორტი","co":"c1791875754866","cr":"ალფიკო AI","m":1,"v":43502,"e":370,"c":4,"w":7,"l":"https://www.facebook.com/reel/2257261768016772","n":""},{"id":"v1791888231667","t":"28 000 ადამიანი შენი ბიზნესის კართან","co":"c1791875754866","cr":"AI","m":1,"v":16126,"e":207,"c":19,"w":4,"l":"https://www.facebook.com/reel/1410097007257858","n":""},{"id":"v1791888290853","t":"მშენებლობის პროცესი","co":"c1791875754866","cr":"AI","m":1,"v":46900,"e":290,"c":48,"w":7,"l":"https://facebook.com/reel/1297887475602550/","n":""},{"id":"v1791891039151","t":"გაზაფხულის პირველი გადაწყვეტილება","co":"c1791875754866","cr":"ალფიკო AI","m":2,"v":56700,"e":202,"c":9,"w":6,"l":"https://facebook.com/reel/1436933564879509/","n":""},{"id":"v1791891302906","t":"თვეში მხოლოდ 550 ლარად","co":"c1791875754866","cr":"ალფიკო AI","m":2,"v":36600,"e":144,"c":9,"w":6,"l":"https://facebook.com/reel/2035957883647149/","n":""},{"id":"v1791891431130","t":"2 თვის უკან ფასი 905$ იყო. ⤷დღეს - უკვე 915$.","co":"c1791875754866","cr":"ალფიკო AI","m":2,"v":9410,"e":240,"c":11,"w":3,"l":"https://www.facebook.com/reel/2237959816729949","n":""},{"id":"v1791891520769","t":"მთელი ქალაქი შენს ეზოში!","co":"c1791875754866","cr":"ალფიკო AI","m":2,"v":36380,"e":165,"c":16,"w":6,"l":"https://www.facebook.com/reel/915166464620665","n":""},{"id":"v1791891586392","t":"დიდ სახლში შენ ირჩევ - როგორ გაატარო დრო.","co":"c1791875754866","cr":"AI","m":2,"v":12704,"e":70,"c":21,"w":5,"l":"https://fb.watch/KdQwLS7Ocl/","n":""},{"id":"v1791891642380","t":"სახლს საყვარელი ადამიანები ახალისებენ","co":"c1791875754866","cr":"AI","m":2,"v":44775,"e":275,"c":2,"w":7,"l":"https://www.facebook.com/reel/935131429063864","n":""},{"id":"v1791891697393","t":"საოცარი შანსი ბინის შესაძენად","co":"c1791875754866","cr":"ალფიკო AI","m":2,"v":55328,"e":250,"c":47,"w":6,"l":"https://www.facebook.com/reel/1448697789451943","n":""},{"id":"v1791892044307","t":"28 000 ადამიანი შენს ბიზნესსზე ისაუბრებს","co":"c1791875754866","cr":"AI","m":3,"v":79902,"e":395,"c":49,"w":4,"l":"https://www.facebook.com/reel/779881134922281","n":""},{"id":"v1791892191442","t":"პატარა ბინის შეძენა","co":"c1791875754866","cr":"AI","m":3,"v":20022,"e":404,"c":19,"w":4,"l":"https://www.facebook.com/reel/1347003623930147","n":""},{"id":"v1791892258521","t":"სხვა კარკასი","co":"c1791875754866","cr":"ანანო","m":3,"v":41400,"e":1100,"c":55,"w":4,"l":"https://facebook.com/reel/3377317055748759/","n":""},{"id":"v1791892364221","t":"შეიძინე კომერციული ფართი 37 კვ.მ-დან","co":"c1791875754866","cr":"ანანო","m":3,"v":40077,"e":248,"c":65,"w":6,"l":"https://www.facebook.com/reel/1215222030452743","n":""},{"id":"v1791892434462","t":"მხოლოდ 25 000 ლარად!","co":"c1791875754866","cr":"AI","m":3,"v":39573,"e":459,"c":154,"w":6,"l":"https://www.facebook.com/reel/2292424081166679","n":""},{"id":"v1791892579906","t":"შეიძინე ორი ბინა ერთის ფასად!","co":"c1791875754866","cr":"AI","m":3,"v":40300,"e":258,"c":58,"w":6,"l":"https://facebook.com/reel/1347457150763497/","n":""},{"id":"v1791892637892","t":"სწორ დროს მიღებული გადაწყვეტილება","co":"c1791875754866","cr":"ალფიკო AI","m":3,"v":62600,"e":1100,"c":31,"w":5,"l":"https://facebook.com/reel/1510292183961322/","n":""},{"id":"v1791892685663","t":"სამშენებლო პროცესი \"სხვა უბანში\"","co":"c1791875754866","cr":"AI","m":3,"v":44850,"e":1023,"c":31,"w":7,"l":"https://www.facebook.com/reel/2473344089749159","n":""},{"id":"v1791897715115","t":"სახლი ლობიდან იწყება.","co":"c1791875754866","cr":"AI","m":4,"v":85023,"e":275,"c":2,"w":6,"l":"https://www.facebook.com/reel/1261384426149807","n":""},{"id":"v1791897888471","t":"სხვა უბანი\" ნიშნავს - ყველაფერს","co":"c1791875754866","cr":"AI","m":4,"v":164806,"e":1130,"c":47,"w":7,"l":"https://www.facebook.com/reel/2130345551147656","n":""},{"id":"v1791898196920","t":"მობინადრეების პანელი","co":"c1791875754866","cr":"მ. მეცხოვრიშვილი","m":4,"v":44503,"e":354,"c":25,"w":7,"l":"https://www.facebook.com/reel/1039904288360345","n":""},{"id":"v1791898348173","t":"ბინა თვეში 550₾","co":"c1791875754866","cr":"ალფიკო AI","m":4,"v":47584,"e":293,"c":46,"w":6,"l":"https://www.facebook.com/reel/2512829522483271","n":""},{"id":"v1791898417361","t":"სახლი ცხოვრების წესია.","co":"c1791875754866","cr":"AI","m":4,"v":9386,"e":55,"c":11,"w":4,"l":"https://fb.watch/KdXbLvTPVn/","n":""},{"id":"v1791898609405","t":"ბინა თვეში 550 ლარად!","co":"c1791875754866","cr":"AI","m":4,"v":79563,"e":378,"c":60,"w":7,"l":"https://www.facebook.com/reel/1262197875690688","n":""},{"id":"v1791898674092","t":"მარო მაყაშვილი","co":"c1791875754866","cr":"AI","m":4,"v":20430,"e":164,"c":26,"w":8,"l":"https://fb.watch/KdXrQWV_Jl/","n":""},{"id":"v1791898967593","t":"ბავშვის ცხოვრება უნდა იყოს აქტიური","co":"c1791875754866","cr":"AI","m":4,"v":14450,"e":258,"c":5,"w":3,"l":"https://www.facebook.com/reel/988796176954498","n":""},{"id":"v1791902296916","t":"შეიძინე ბინა თვეში 550₾-ად","co":"c1791875754866","cr":"AI","m":5,"v":28659,"e":526,"c":43,"w":3,"l":"https://www.facebook.com/reel/2145809956152371","n":""},{"id":"v1791902349733","t":"შენი ბიზნესი უკვე წარმატებულია","co":"c1791875754866","cr":"AI","m":5,"v":28062,"e":134,"c":6,"w":4,"l":"https://www.facebook.com/reel/979791264662155","n":""},{"id":"v1791902397763","t":"28 000 ადამიანი ნიშნავს…","co":"c1791875754866","cr":"AI","m":5,"v":25100,"e":68,"c":12,"w":3,"l":"https://facebook.com/reel/1761865818136429/","n":""},{"id":"v1791902455689","t":"კომერციული","co":"c1791875754866","cr":"AI","m":5,"v":39488,"e":141,"c":14,"w":8,"l":"https://www.facebook.com/reel/877045738779967","n":""},{"id":"v1791902509878","t":"ზოგი გემო ყველას გვაერთიანებს…","co":"c1791875754866","cr":"AI","m":5,"v":48214,"e":101,"c":21,"w":5,"l":"https://www.facebook.com/reel/959764520395149","n":""},{"id":"v1791902673039","t":"ბიზნესს სჭირდება სწორი ადგილი და სტაბილური მომხმარებელი.","co":"c1791875754866","cr":"AI","m":5,"v":20520,"e":20520,"c":6,"w":7,"l":"https://www.facebook.com/reel/1998567777433937","n":""},{"id":"v1791903551735","t":"არანაირი წინასწარი შენატანი","co":"c1791875754866","cr":"საბა","m":6,"v":65539,"e":2139,"c":181,"w":4,"l":"https://www.facebook.com/reel/1608402860617896","n":""},{"id":"v1791903630283","t":"ბინა თვეში მხოლოდ 880 ლარად","co":"c1791875754866","cr":"საბა","m":6,"v":108200,"e":2200,"c":697,"w":9,"l":"https://facebook.com/reel/4505620503094593/","n":""},{"id":"v1791903690989","t":"5 ივლისს, კვირას, მაღალი მომართვიანობის გამო","co":"c1791875754866","cr":"AI","m":6,"v":13522,"e":245,"c":9,"w":4,"l":"https://www.facebook.com/reel/1690005612206345","n":""},{"id":"v1791903773309","t":"კვ.მ $905-ად","co":"c1791875754866","cr":"AI","m":6,"v":63900,"e":1400,"c":33,"w":2,"l":"https://facebook.com/reel/1737421217602953/","n":""},{"id":"v1791903870951","t":"ბინა კვ.მ 905-ად - დიდ დიღომში.","co":"c1791875754866","cr":"საბა","m":6,"v":90319,"e":1880,"c":62,"w":3,"l":"https://www.facebook.com/reel/1668452290932501","n":""},{"id":"v1791903956311","t":"ყველაფერი სახლის მისამართიდან იწყება.","co":"c1791875754866","cr":"AI","m":6,"v":68679,"e":648,"c":16,"w":5,"l":"https://fb.watch/Ke0BTody5w/","n":""},{"id":"v1791904079069","t":"ჩვენ Cavea+ის მთავარი სპონსორები ვართ","co":"c1791875754866","cr":"AI","m":6,"v":6900,"e":63,"c":17,"w":5,"l":"https://fb.watch/Ke0I-Ow7dA/","n":""},{"id":"v1791904149846","t":"ბინა დიდ დიღომში - თვეში 550 ლარად!","co":"c1791875754866","cr":"AI","m":6,"v":34901,"e":497,"c":50,"w":3,"l":"https://fb.watch/Ke0NMp0ZJY/","n":""},{"id":"v1791904340346","t":"მშენებლობის პროცესი \"სხვა უბანში\"","co":"c1791875754866","cr":"AI","m":6,"v":16332,"e":406,"c":31,"w":9,"l":"https://fb.watch/Ke0ZJppfiP/","n":""},{"id":"v1791904419145","t":"ძვირფასო მობინადრეებო - მადლობა!","co":"c1791875754866","cr":"საბა","m":6,"v":23612,"e":690,"c":29,"w":5,"l":"https://www.facebook.com/reel/997973309741847","n":""},{"id":"v1792571759102","t":"ალფა სახლი & კავეა, ჩ.ც.დ","co":"c1791875754866","cr":"AI","m":6,"v":64538,"e":1308,"c":52,"w":4,"l":"https://fb.watch/v/7rayVELZH/","n":""},{"id":"v1792571861532","t":"ჩცდ\"-ს მსახიობები","co":"c1791875754866","cr":"AI","m":6,"v":39073,"e":767,"c":64,"w":9,"l":"https://fb.watch/KocROglkmp/","n":""},{"id":"v1792572025270","t":"ნელიკოს ბლინები \"სხვა უბანში\"?","co":"c1791875754866","cr":"AI","m":6,"v":21834,"e":689,"c":46,"w":8,"l":"https://fb.watch/v/d3FcAVKD5/","n":""},{"id":"v1792572167918","t":"სახლი უნდა ერგებოდეს შენს სურვილებს","co":"c1791875754866","cr":"AI","m":6,"v":17355,"e":548,"c":16,"w":4,"l":"https://www.facebook.com/reel/1578408283914295","n":""},{"id":"v1792572244889","t":"სპაიდერმენი ბრუნდება!","co":"c1791875754866","cr":"ალფიკო AI","m":7,"v":18921,"e":223,"c":9,"w":3,"l":"https://www.facebook.com/reel/1590568079312416","n":""},{"id":"v1792572315855","t":"ყველა ქალს სურს - საკუთარი ჭერი","co":"c1791875754866","cr":"AI","m":7,"v":16593,"e":860,"c":11,"w":7,"l":"https://fb.watch/v/boZ7XWLnv/","n":""},{"id":"v1792572400249","t":"ადამიანი ობობას\" პრემიერა","co":"c1791875754866","cr":"ალფიკო AI","m":7,"v":15950,"e":503,"c":7,"w":3,"l":"https://www.facebook.com/reel/1583088963492990","n":""},{"id":"v1792572471736","t":"ბინა წინასწარი შენატანის გარეშე!","co":"c1791875754866","cr":"ალფიკო AI","m":7,"v":45775,"e":781,"c":71,"w":3,"l":"https://www.facebook.com/reel/2901702610171507","n":""},{"id":"v1792572706624","t":"დაზოგე 25 000 ლარამდე","co":"c1791875754866","cr":"ალფიკო AI","m":7,"v":53755,"e":715,"c":44,"w":2,"l":"https://www.facebook.com/reel/939665395098483","n":""},{"id":"v1792572854665","t":"ბინის ყიდვის დროს ზოგავ 60 000 ლარს!","co":"c1791875754866","cr":"საბა","m":7,"v":62349,"e":1442,"c":49,"w":5,"l":"https://www.facebook.com/reel/1583284553534180","n":""},{"id":"v1792572915633","t":"ფიქრში გადის დრო, რომელსაც უკან ვეღარ დააბრუნებ","co":"c1791875754866","cr":"AI","m":7,"v":62504,"e":1273,"c":19,"w":3,"l":"https://fb.watch/v/66YFBQZFY/","n":""},{"id":"v1792572997001","t":"გამოიცანი ვისი სახლია სურათზე","co":"c1791875754866","cr":"AI","m":7,"v":27900,"e":931,"c":18,"w":13,"l":"https://facebook.com/reel/1067596372298921/","n":""},{"id":"v1792574590904","t":"28 000 ადამიანი შენი ბიზნესის კართან","co":"c1791875754866","cr":"საბა","m":8,"v":239563,"e":539,"c":32,"w":8,"l":"https://www.facebook.com/reel/1054188410866612","n":""},{"id":"v1792574684378","t":"ჩვენი შეხვედრა არ არის შემთხვევითი","co":"c1791875754866","cr":"AI","m":8,"v":71000,"e":1400,"c":23,"w":3,"l":"https://facebook.com/reel/1981756519184604/","n":""},{"id":"v1792574808105","t":"შეიძინე ბინა დასრულებულ პროექტში","co":"c1791875754866","cr":"ალფიკო AI","m":8,"v":51437,"e":1120,"c":53,"w":5,"l":"https://www.facebook.com/reel/2081884912750565","n":""},{"id":"v1792574866988","t":"თვეში მხოლოდ 550 ლარად","co":"c1791875754866","cr":"AI","m":8,"v":81959,"e":1073,"c":29,"w":3,"l":"https://www.facebook.com/reel/924410687405340","n":""},{"id":"v1792574967440","t":"შეხვდი ალფიკოს Cavea City Mall-ში","co":"c1791875754866","cr":"ალფიკო AI","m":8,"v":36919,"e":1060,"c":9,"w":3,"l":"https://www.facebook.com/reel/1816394153142975","n":""},{"id":"v1792575041092","t":"დაარეზერვე სასურველი ბინა","co":"c1791875754866","cr":"AI","m":8,"v":31100,"e":727,"c":15,"w":3,"l":"https://facebook.com/reel/1020190557738110/","n":""},{"id":"v1792575107655","t":"საყვარელი ინფლუენსერის რემონტს ისევ უყურებ?","co":"c1791875754866","cr":"საბა","m":8,"v":45756,"e":1223,"c":88,"w":3,"l":"https://www.facebook.com/reel/38800771569538725","n":""},{"id":"v1792575183133","t":"სექტემბერი ხარჯებით სავსე თვეა.","co":"c1791875754866","cr":"საბა","m":8,"v":63368,"e":753,"c":65,"w":4,"l":"https://fb.watch/v/5TvwhB3Fv/","n":""},{"id":"v1792575223139","t":"დაიწყე ბიზნესი იქ, სადაც 28 000 მობინადრე გელოდება!","co":"c1791875754866","cr":"საბა","m":8,"v":81900,"e":2400,"c":69,"w":5,"l":"https://facebook.com/reel/1621750699451536/","n":""},{"id":"v1792575301890","t":"ბინა თვეში მხოლოდ 550 ლარად","co":"c1791875754866","cr":"AI","m":8,"v":57542,"e":958,"c":42,"w":3,"l":"https://www.facebook.com/reel/1086471477448372","n":""},{"id":"v1792575347128","t":"ზოგჯერ ერთი მოულოდნელი სიურპრიზიც საკმარისია","co":"c1791875754866","cr":"ალფიკო AI","m":8,"v":15190,"e":920,"c":0,"w":3,"l":"https://www.facebook.com/reel/1363148712568217","n":""},{"id":"v1792575418879","t":"სიყვარულს თავისი მისამართი აქვს","co":"c1791875754866","cr":"AI","m":9,"v":26694,"e":920,"c":16,"w":4,"l":"https://fb.watch/v/4UJ3sPeNV/","n":""},{"id":"v1792575463933","t":"დრო იწურება! ⤷ შეიძინე ბინა დიდ დიღომში","co":"c1791875754866","cr":"AI","m":9,"v":52635,"e":585,"c":6,"w":2,"l":"https://fb.watch/v/7LgyM8Nt0/","n":""},{"id":"v1792575611984","t":"ბინა დიდ დიღომში კვ.მ. 905-ად","co":"c1791875754866","cr":"საბა","m":9,"v":22250,"e":1179,"c":151,"w":6,"l":"https://www.facebook.com/reel/1659280102449676","n":""},{"id":"v1792575687358","t":"ბინა დიდ დიღომში - 25კვ.მ.-დან! ⤷ თვეში 550 ლარად.","co":"c1791875754866","cr":"AI","m":9,"v":15985,"e":534,"c":46,"w":4,"l":"https://www.facebook.com/reel/1649712753480033","n":""},{"id":"v1792575770520","t":"\"ნელ-ნელა გავარემონტებ“","co":"c1791875754866","cr":"AI","m":9,"v":21200,"e":629,"c":1,"w":7,"l":"https://facebook.com/reel/1846260623490813/","n":""},{"id":"v1792575821959","t":"მხოლოდ 25 ოქტომბრამდე","co":"c1791875754866","cr":"ანანო","m":9,"v":11618,"e":369,"c":14,"w":8,"l":"https://www.facebook.com/reel/2160825481139430","n":""},{"id":"v1792575975821","t":"როცა 28 000 მობინადრე შენი პოტენციური მომხმარებელია.","co":"c1791875754866","cr":"AI","m":9,"v":16705,"e":187,"c":2,"w":3,"l":"https://www.facebook.com/reel/1958889108419738","n":""},{"id":"v1792582237034","t":"ბინა დიდ დიღომში, კვ.მ 905$-ად!","co":"c1792582168784","cr":"ავთო","m":0,"v":31300,"e":306,"c":91,"w":6,"l":"https://facebook.com/reel/1228713945798076/","n":""},{"id":"v1792582319767","t":"ბინა დიდი დიღომში, მხოლოდ 32 800 $-ად.","co":"c1792582168784","cr":"ავთო","m":0,"v":19800,"e":201,"c":38,"w":15,"l":"https://facebook.com/reel/25567490079571198/","n":""},{"id":"v1792582373865","t":"შეიძინე ორ საძინებლიანი ბინა დიდი დიღომში!","co":"c1792582168784","cr":"ავთო","m":0,"v":93300,"e":1500,"c":456,"w":10,"l":"https://facebook.com/reel/1171783495119319/","n":""},{"id":"v1792582429116","t":"მხოლოდ დღეს დაზოგე 200$ კვ.მ-ზე","co":"c1792582168784","cr":"ავთო","m":0,"v":61300,"e":161,"c":16,"w":6,"l":"https://facebook.com/reel/843415488744389/","n":""},{"id":"v1792582482345","t":"დაზოგე 345$ კვ.მ-ზე.","co":"c1792582168784","cr":"ავთო","m":0,"v":17200,"e":168,"c":37,"w":10,"l":"https://facebook.com/reel/873936618583331/","n":""},{"id":"v1792582521056","t":"ბინა დიდ დიღომში, კვ.მ 905$-ად!","co":"c1792582168784","cr":"ავთო","m":0,"v":10200,"e":84,"c":8,"w":5,"l":"https://facebook.com/reel/1166086602177256/","n":""},{"id":"v1792582572596","t":"დაზოგე 100$ კვ.მ-ზე.","co":"c1792582168784","cr":"ავთო","m":0,"v":17100,"e":202,"c":54,"w":8,"l":"https://facebook.com/reel/913614257676427/","n":""},{"id":"v1792582609764","t":"შეიძინე ბინა 24 კვ.მ-დან დიდ დიღომში","co":"c1792582168784","cr":"ავთო","m":0,"v":108200,"e":652,"c":161,"w":8,"l":"https://facebook.com/reel/744152521635830/","n":""},{"id":"v1792582923929","t":"შეიძინე თბილისში ბინა თვეში მხოლოდ 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":0,"v":110100,"e":1100,"c":267,"w":9,"l":"https://facebook.com/reel/1414042420101133/","n":""},{"id":"v1792583095264","t":"მხოლოდ დღეს დაზოგე 200$ კვ.მ-ზე.","co":"c1792582168784","cr":"ავთო","m":0,"v":22900,"e":124,"c":30,"w":13,"l":"https://facebook.com/reel/719963560957479/","n":""},{"id":"v1792583214251","t":"ბინა რემონტით - კიკვიძის პარკთან.","co":"c1792582168784","cr":"ავთო","m":0,"v":21900,"e":157,"c":25,"w":11,"l":"https://facebook.com/reel/730308119866379/","n":""},{"id":"v1792583351694","t":"გახდი ბინის მფლობელი 16 965$-ად.","co":"c1792582168784","cr":"ავთო","m":0,"v":76700,"e":818,"c":243,"w":6,"l":"https://facebook.com/reel/638515399344275/","n":""},{"id":"v1792583493396","t":"ბინა სრული რემონტითა და ავეჯით","co":"c1792582168784","cr":"ავთო","m":0,"v":40200,"e":636,"c":202,"w":9,"l":"https://facebook.com/reel/26720947177494423/","n":""},{"id":"v1792583570850","t":"დუპლექსი დიდ დიღომში","co":"c1792582168784","cr":"ავთო","m":0,"v":5700,"e":97,"c":22,"w":7,"l":"https://facebook.com/reel/840111615672047/","n":""},{"id":"v1792583652134","t":"შეიძინე ბინა წინასწარი შენატანის გარეშე!","co":"c1792582168784","cr":"ავთო","m":0,"v":44800,"e":581,"c":84,"w":7,"l":"https://facebook.com/reel/1570676340652032/","n":""},{"id":"v1792583701323","t":"$100 მილიონზე მეტი რეალიზებული ქონება","co":"c1792582168784","cr":"ავთო","m":0,"v":11300,"e":41,"c":0,"w":20,"l":"https://facebook.com/reel/1183868873817217/","n":""},{"id":"v1792584745463","t":"გამოცდილება, რომელსაც ენდობიან","co":"c1792582168784","cr":"ავთო","m":0,"v":7700,"e":30,"c":8,"w":9,"l":"https://facebook.com/reel/770786132266925/","n":""},{"id":"v1792584893529","t":"შეიძინე ბინა თბილისში თვეში 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":0,"v":5500,"e":89,"c":4,"w":8,"l":"https://facebook.com/reel/893911596558142/","n":""},{"id":"v1792584954251","t":"შეიძინე ბინა დიდ დიღომში","co":"c1792582168784","cr":"ავთო","m":0,"v":82800,"e":885,"c":249,"w":7,"l":"https://facebook.com/reel/802805289486996/","n":""},{"id":"v1792585123974","t":"28 000 მომხმარებელი შენი ბიზნესისთვის!","co":"c1792582168784","cr":"ავთო","m":1,"v":2700,"e":50,"c":2,"w":6,"l":"https://facebook.com/reel/4232516870408947/","n":""},{"id":"v1792585224182","t":"გახდი ორსაძინებლიანი ბინის მფლობელი","co":"c1792582168784","cr":"ავთო","m":1,"v":26600,"e":631,"c":70,"w":6,"l":"https://facebook.com/reel/25430875689946289/","n":""},{"id":"v1792585343914","t":"ბინის შერჩევისას გინდა \"მცოდნე მეგობარი“?","co":"c1792582168784","cr":"ავთო","m":1,"v":10600,"e":44,"c":2,"w":33,"l":"https://facebook.com/reel/1962664417661623/","n":""},{"id":"v1792585494100","t":"შეიძინე ბინა საბურთალოზე","co":"c1792582168784","cr":"ავთო","m":1,"v":32400,"e":1400,"c":21,"w":4,"l":"https://facebook.com/reel/2679963069029034/","n":""},{"id":"v1792585750275","t":"შეიძინე ბინა დიდ დიღომში","co":"c1792582168784","cr":"ალფიკო AI","m":1,"v":7800,"e":134,"c":11,"w":6,"l":"https://facebook.com/reel/1280281647482493/","n":""},{"id":"v1792585808823","t":"დიდ დიღომში თვეში მხოლოდ 980 ლარად!","co":"c1792582168784","cr":"ავთო","m":1,"v":7600,"e":123,"c":30,"w":8,"l":"https://facebook.com/reel/1532367677862291/","n":""},{"id":"v1792586105746","t":"დიდ დიღომში ან გლდანში, თვეში მხოლოდ 550 ლარად!","co":"c1792582168784","cr":"ავთო","m":1,"v":194800,"e":2200,"c":480,"w":7,"l":"https://facebook.com/reel/1561411328477360/","n":""},{"id":"v1792586283394","t":"ისარგებლე სუბსიდირების პროგრამით","co":"c1792582168784","cr":"ავთო","m":1,"v":352600,"e":5000,"c":457,"w":13,"l":"https://facebook.com/reel/935384989020622/","n":""},{"id":"v1792586337769","t":"ბინა გლდანში - თვეში მხოლოდ 550 ლარად!","co":"c1792582168784","cr":"ავთო","m":1,"v":29600,"e":319,"c":98,"w":5,"l":"https://facebook.com/reel/1650224386181608/","n":""},{"id":"v1792586464125","t":"ისარგებლე სახელმწიფო სუბსიდირების პროგრამით.","co":"c1792582168784","cr":"ავთო","m":1,"v":77700,"e":1600,"c":210,"w":2,"l":"https://facebook.com/reel/1426489285635151/","n":""},{"id":"v1792586529789","t":"დღეში 20 წუთს კარგავთ მანქანის ადგილის ძებნაში?","co":"c1792582168784","cr":"ავთო","m":1,"v":2700,"e":40,"c":4,"w":7,"l":"https://facebook.com/reel/1206577264871543/","n":""},{"id":"v1792586840616","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად!","co":"c1792582168784","cr":"ავთო","m":1,"v":9800,"e":163,"c":46,"w":8,"l":"https://facebook.com/reel/4504431446454679/","n":""},{"id":"v1792586954802","t":"შეიძინე ბინა სანზონაში - კვ.მ მხოლოდ 905$-ად","co":"c1792582168784","cr":"ავთო","m":1,"v":50400,"e":638,"c":200,"w":9,"l":"https://facebook.com/reel/2077602549694872/","n":""},{"id":"v1792587053236","t":"თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"ავთო","m":1,"v":512200,"e":6400,"c":1800,"w":7,"l":"https://facebook.com/reel/918633860529231/","n":""},{"id":"v1792587098769","t":"ეძებთ გარანტირებულ და სტაბილურ შემოსავალს?","co":"c1792582168784","cr":"ავთო","m":1,"v":6100,"e":59,"c":8,"w":6,"l":"https://facebook.com/reel/1455817662725760/","n":""},{"id":"v1792587204462","t":"ნუ ხარჯავთ ფულს რეკლამაში","co":"c1792582168784","cr":"ავთო","m":1,"v":1200,"e":38,"c":8,"w":6,"l":"https://facebook.com/reel/2292176967986623/","n":""},{"id":"v1792587280015","t":"ელოდები ფასის კლებას უძრავ ქონებაზე?","co":"c1792582168784","cr":"ავთო","m":1,"v":3100,"e":48,"c":10,"w":6,"l":"https://facebook.com/reel/1270615331606372/","n":""},{"id":"v1792587359677","t":"რატომ ირჩევენ ინვესტორები დიდ დიღომსა და გლდანს ?","co":"c1792582168784","cr":"ავთო","m":1,"v":8600,"e":144,"c":35,"w":9,"l":"https://facebook.com/reel/927133473599103/","n":""},{"id":"v1792587402269","t":"თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"ავთო","m":1,"v":82200,"e":1000,"c":255,"w":8,"l":"https://facebook.com/reel/1250384147030796/","n":""},{"id":"v1792587437694","t":"რატომ არის დიდი აივანი თქვენი სახლის უპირატესობა?","co":"c1792582168784","cr":"ავთო","m":1,"v":19200,"e":338,"c":22,"w":11,"l":"https://facebook.com/reel/1407720458057018/","n":""},{"id":"v1792588608163","t":"დაიწყე გაზაფხული მნიშვნელოვანი გადაწყვეტილებით!","co":"c1792582168784","cr":"ალფიკო AI","m":2,"v":11400,"e":99,"c":18,"w":16,"l":"https://facebook.com/reel/2841338009546740/","n":""},{"id":"v1792588686046","t":"ბინა თბილისში, თვეში მხოლოდ 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":2,"v":80800,"e":928,"c":214,"w":9,"l":"https://facebook.com/reel/1409440773730658/","n":""},{"id":"v1792588775451","t":"დაიწყე ბიზნესი დიდ დიღომში.","co":"c1792582168784","cr":"AI","m":2,"v":10400,"e":51,"c":10,"w":5,"l":"https://facebook.com/reel/2492122884556386/","n":""},{"id":"v1792588827903","t":"კვ.მ მხოლოდ 915$-ად","co":"c1792582168784","cr":"ავთო","m":2,"v":69700,"e":674,"c":113,"w":12,"l":"https://facebook.com/reel/1408805580926916/","n":""},{"id":"v1792588877739","t":"ბინა გლდანში, თვეში მხოლოდ 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":2,"v":61900,"e":702,"c":112,"w":8,"l":"https://facebook.com/reel/798348619376841/","n":""},{"id":"v1792588920529","t":"დუპლექსი დიდ დიღომში","co":"c1792582168784","cr":"ავთო","m":2,"v":37500,"e":191,"c":20,"w":10,"l":"https://facebook.com/reel/1234790234993182/","n":""},{"id":"v1792588975462","t":"თვეში მხოლოდ 865 ლარად - ბინა თბილისში.","co":"c1792582168784","cr":"ავთო","m":2,"v":4900,"e":91,"c":16,"w":9,"l":"https://facebook.com/reel/1670010317324390/","n":""},{"id":"v1792589013025","t":"ყველაზე დიდი შეცდომა","co":"c1792582168784","cr":"ავთო","m":2,"v":3500,"e":51,"c":8,"w":8,"l":"https://facebook.com/reel/1454796442804440/","n":""},{"id":"v1792589058846","t":"კვ.მ მხოლოდ 915$ - ბინა დიდ დიღომში.","co":"c1792582168784","cr":"ავთო","m":2,"v":32700,"e":236,"c":35,"w":8,"l":"https://facebook.com/reel/26147789748192940/","n":""},{"id":"v1792589095774","t":"კომპლექსი vs ცალკეული კორპუსი","co":"c1792582168784","cr":"ავთო","m":2,"v":2200,"e":45,"c":4,"w":7,"l":"https://facebook.com/reel/1436252831575639/","n":""},{"id":"v1792589129302","t":"დაზოგე 48 000 ლარი ბინის ყიდვისას.","co":"c1792582168784","cr":"ავთო","m":2,"v":5300,"e":98,"c":7,"w":10,"l":"https://facebook.com/reel/1406796240769861/","n":""},{"id":"v1792589160991","t":"შეიძინე თბილისში ბინა თვეში მხოლოდ 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":2,"v":11200,"e":178,"c":51,"w":6,"l":"https://facebook.com/reel/1471662727666005/","n":""},{"id":"v1792589218300","t":"თვეში მხოლოდ 550 ლარად - შეიძინე ბინა გლდანში.","co":"c1792582168784","cr":"ავთო","m":2,"v":147700,"e":2000,"c":384,"w":11,"l":"https://facebook.com/reel/27148247998099106/","n":""},{"id":"v1792589259060","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"ავთო","m":2,"v":15100,"e":221,"c":75,"w":7,"l":"https://facebook.com/reel/1293828562627010/","n":""},{"id":"v1792589324569","t":"ბინა გლდანში - თვეში მხოლოდ 550 ლარად.","co":"c1792582168784","cr":"ავთო","m":2,"v":29000,"e":464,"c":132,"w":9,"l":"https://facebook.com/reel/1813504553369269/","n":""},{"id":"v1792589358305","t":"თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"ავთო","m":2,"v":13400,"e":270,"c":77,"w":10,"l":"https://facebook.com/reel/2006491466928980/","n":""},{"id":"v1792589398604","t":"დაიწყე ბიზნესი იქ, სადაც მომხმარებელი უკვე გელოდება!","co":"c1792582168784","cr":"ავთო","m":2,"v":3000,"e":60,"c":8,"w":8,"l":"https://facebook.com/reel/3001153116744604/","n":""},{"id":"v1792589439586","t":"შეიძინე ბინა და გათავისუფლდი 2 წელი იპოთეკური სესხის გადახდისგან.","co":"c1792582168784","cr":"საბა","m":2,"v":21000,"e":315,"c":75,"w":9,"l":"https://facebook.com/reel/1488751106259951/","n":""},{"id":"v1792589552031","t":"მიიღე 16 კვ.მ საჩუქრად.","co":"c1792582168784","cr":"ავთო","m":2,"v":8100,"e":204,"c":122,"w":6,"l":"https://facebook.com/reel/1452143795773396/","n":""},{"id":"v1792589590239","t":"შეიძინე ბინა დაზოგე 27 000$","co":"c1792582168784","cr":"ავთო","m":2,"v":6300,"e":114,"c":30,"w":9,"l":"https://facebook.com/reel/2692701017775041/","n":""},{"id":"v1792589631106","t":"შეიძინე ბინა და მიიღე 50,000 ლარის სარგებელი","co":"c1792582168784","cr":"საბა","m":2,"v":4300,"e":110,"c":40,"w":8,"l":"https://facebook.com/reel/1417862960084089/","n":""},{"id":"v1792589686598","t":"ბინა თბილისში კვ.მ 775$-ად.","co":"c1792582168784","cr":"ავთო","m":2,"v":24200,"e":325,"c":70,"w":10,"l":"https://facebook.com/reel/945502297972880/","n":""},{"id":"v1792589733815","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"საბა","m":2,"v":4500,"e":85,"c":21,"w":8,"l":"https://facebook.com/reel/2050123628896167/","n":""},{"id":"v1792589796237","t":"მხოლოდ 25500 ლარად","co":"c1792582168784","cr":"ავთო","m":2,"v":20900,"e":322,"c":77,"w":8,"l":"https://facebook.com/reel/951051403960430/","n":""},{"id":"v1792589913627","t":"დაზოგე 27 495$ - შეიძინე ბინა გლდანში.","co":"c1792582168784","cr":"საბა","m":2,"v":22400,"e":195,"c":53,"w":11,"l":"https://facebook.com/reel/25936252806045792/","n":""},{"id":"v1792589960043","t":"25 500 ლარად - გახდი ბინის მესაკუთრე თბილისში.","co":"c1792582168784","cr":"ავთო","m":2,"v":69100,"e":1200,"c":480,"w":9,"l":"https://facebook.com/reel/3188887471500755/","n":""},{"id":"v1792654004538","t":"ბინა გლდანში - მხოლოდ 25 500 ლარად.","co":"c1792582168784","cr":"ავთო","m":3,"v":30400,"e":447,"c":172,"w":8,"l":"https://facebook.com/reel/1291809499564913/","n":""},{"id":"v1792654096224","t":"28 000 ადამიანი შენს ბიზნესსზე ისაუბრებს","co":"c1792582168784","cr":"AI","m":3,"v":2600,"e":45,"c":6,"w":6,"l":"https://facebook.com/reel/1252014370472370/","n":""},{"id":"v1792654186516","t":"ზღვიდან 100 მეტრში.","co":"c1792582168784","cr":"საბა","m":3,"v":2400,"e":35,"c":6,"w":8,"l":"https://facebook.com/reel/1197813895576764/","n":""},{"id":"v1792654239461","t":"ბინა თბილისში კვ.მ 775$-ად.","co":"c1792582168784","cr":"ავთო","m":3,"v":5200,"e":141,"c":76,"w":8,"l":"https://facebook.com/reel/989352100273491/","n":""},{"id":"v1792654384694","t":"პატარა ბინა - დიდი დასაწყისი.","co":"c1792582168784","cr":"AI","m":3,"v":3800,"e":63,"c":18,"w":7,"l":"https://facebook.com/reel/2041962406750530/","n":""},{"id":"v1792654428529","t":"შეიძინე ბინა და გათავისუფლდი 2 წელი იპოთეკური სესხის გადახდისგან","co":"c1792582168784","cr":"საბა","m":3,"v":18200,"e":287,"c":91,"w":10,"l":"https://facebook.com/reel/1371507484745350/","n":""},{"id":"v1792654477751","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"საბა","m":3,"v":4200,"e":76,"c":22,"w":8,"l":"https://facebook.com/reel/2022207592068077/","n":""},{"id":"v1792654595622","t":"ბინა გლდანში - თვეში მხოლოდ 865 ლარად!","co":"c1792582168784","cr":"ავთო","m":3,"v":8000,"e":97,"c":14,"w":11,"l":"https://facebook.com/reel/1442223530698546/","n":""},{"id":"v1792654634618","t":"შეიძინე ორი ბინა - ერთის ფასად!","co":"c1792582168784","cr":"საბა","m":3,"v":4600,"e":35,"c":0,"w":14,"l":"https://facebook.com/reel/1764641781181291/","n":""},{"id":"v1792654664866","t":"ბინა თვეში მხოლოდ 550 ლარად.","co":"c1792582168784","cr":"ავთო","m":3,"v":4300,"e":79,"c":15,"w":7,"l":"https://facebook.com/reel/938797802192739/","n":""},{"id":"v1792654702378","t":"მესაკუთრის სტატუსი რეესტრში","co":"c1792582168784","cr":"ავთო","m":3,"v":9200,"e":109,"c":13,"w":8,"l":"https://facebook.com/reel/1497211888753208/","n":""},{"id":"v1792654754159","t":"იაპონური ხარისხი - FUJI","co":"c1792582168784","cr":"ავთო","m":3,"v":1900,"e":25,"c":0,"w":5,"l":"https://facebook.com/reel/2022919895305965/","n":""},{"id":"v1792654787102","t":"შეიძინე ორი ბინა - ერთის ფასად!","co":"c1792582168784","cr":"ავთო","m":3,"v":1400,"e":15,"c":2,"w":4,"l":"https://facebook.com/reel/1641258810209420/","n":""},{"id":"v1792654842243","t":"მხოლოდ 25 500 ლარად","co":"c1792582168784","cr":"ავთო","m":3,"v":137700,"e":2300,"c":1000,"w":10,"l":"https://facebook.com/reel/830185966172265/","n":""},{"id":"v1792654881526","t":"ბინა თბილისში - კვ.მ. მხოლოდ 915$","co":"c1792582168784","cr":"ავთო","m":3,"v":1800,"e":18,"c":0,"w":3,"l":"https://facebook.com/reel/1830679674268543/","n":""},{"id":"v1792654932237","t":"დაზოგე 20 000$ მარტივად.","co":"c1792582168784","cr":"ავთო","m":3,"v":9500,"e":278,"c":15,"w":4,"l":"https://facebook.com/reel/1991633041571093/","n":""},{"id":"v1792654995053","t":"ბინა თბილისში კვ.მ 775$-ად.","co":"c1792582168784","cr":"საბა","m":3,"v":47200,"e":1300,"c":294,"w":18,"l":"https://facebook.com/reel/937414315952010/","n":""},{"id":"v1792655039612","t":"როგორ შევარჩიოთ ბინა","co":"c1792582168784","cr":"ავთო","m":3,"v":4000,"e":53,"c":0,"w":9,"l":"https://facebook.com/reel/946389931513249/","n":""},{"id":"v1792655101463","t":"ბინების 97% უკვე გაყიდულია!","co":"c1792582168784","cr":"AI","m":3,"v":7300,"e":37,"c":2,"w":15,"l":"https://facebook.com/reel/3858516264283949/","n":""},{"id":"v1792655142544","t":"დაზოგე 18 500 $ მარტივად.","co":"c1792582168784","cr":"ავთო","m":3,"v":3500,"e":103,"c":52,"w":8,"l":"https://facebook.com/reel/2029898264612341/","n":""},{"id":"v1792655180954","t":"მხოლოდ 3 დღე! ბინა თბილისში","co":"c1792582168784","cr":"ავთო","m":3,"v":4600,"e":89,"c":26,"w":7,"l":"https://facebook.com/reel/4733605236911035/","n":""},{"id":"v1792655222740","t":"დაზოგე 27 495$ - ბინა გლდანში კვ.მ 915$-ად.","co":"c1792582168784","cr":"საბა","m":3,"v":10200,"e":265,"c":85,"w":17,"l":"https://facebook.com/reel/1287959770147479/","n":""},{"id":"v1792655454840","t":"დაბალსართულზე ცხოვრობ და ლიფტის ფულს მაინც იხდი?","co":"c1792582168784","cr":"ავთო","m":3,"v":11800,"e":179,"c":31,"w":11,"l":"https://facebook.com/reel/2872746213062380/","n":""},{"id":"v1792655516538","t":"არ იყიდო ბინა, სანამ ამას არ ნახავ!","co":"c1792582168784","cr":"თაკო იურისტი","m":3,"v":68300,"e":872,"c":35,"w":8,"l":"https://facebook.com/reel/832876273198166/","n":""},{"id":"v1792656023896","t":"რა უნდა გაითვალისწინო, სანამ რემონტს დაიწყებ?","co":"c1792582168784","cr":"ავთო","m":4,"v":28100,"e":138,"c":0,"w":15,"l":"https://facebook.com/reel/845852847906892/","n":""},{"id":"v1792656107767","t":"აივანი, როგორც ფუნქციური სივრცე","co":"c1792582168784","cr":"საბა","m":4,"v":51600,"e":299,"c":30,"w":10,"l":"https://facebook.com/reel/2008216913239252/","n":""},{"id":"v1792656193493","t":"მითები უსაფრთხოებაზე და რეალური უპირატესობები","co":"c1792582168784","cr":"ავთო","m":4,"v":107900,"e":545,"c":137,"w":12,"l":"https://facebook.com/reel/2208222689933115/","n":""},{"id":"v1792656296164","t":"რატომ არის უძრავი ქონება საუკეთესო არჩევანი?","co":"c1792582168784","cr":"საბა","m":4,"v":2300,"e":28,"c":0,"w":6,"l":"https://facebook.com/reel/978024535170114/","n":""},{"id":"v1792656415759","t":"ვის ეკუთვნის პარკინგი კორპუსის ეზოში?","co":"c1792582168784","cr":"ავთო","m":4,"v":4500,"e":67,"c":3,"w":10,"l":"https://facebook.com/reel/1966234960664975/","n":""},{"id":"v1792656592621","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად.","co":"c1792582168784","cr":"ავთო","m":4,"v":248000,"e":6500,"c":3400,"w":5,"l":"https://facebook.com/reel/1526154485754589/","n":""},{"id":"v1792656834974","t":"რატომ არის 50 კვ.მ უფრო დიდი, ვიდრე 70?","co":"c1792582168784","cr":"საბა","m":4,"v":7600,"e":134,"c":20,"w":15,"l":"https://facebook.com/reel/988791087069510/","n":""},{"id":"v1792657069381","t":"სამშენებლო ობიექტის დათვალიერების წესი","co":"c1792582168784","cr":"თაკო იურისტი","m":4,"v":2500,"e":45,"c":7,"w":6,"l":"https://facebook.com/reel/2256197734908665/","n":""},{"id":"v1792657419227","t":"ბინის თვითნებური გადაკეთება","co":"c1792582168784","cr":"თაკო იურისტი","m":4,"v":2500,"e":47,"c":6,"w":7,"l":"https://facebook.com/reel/965066773042948/","n":""},{"id":"v1792657592597","t":"უნდა იყოს თუ არა სადარბაზოს კარი ჩაკეტილი?","co":"c1792582168784","cr":"ავთო","m":4,"v":2500,"e":44,"c":0,"w":8,"l":"https://facebook.com/reel/1317061510356679/","n":""},{"id":"v1792657754092","t":"მეზობლის კონდიციონერის წვეთების ხმა არ გაძინებთ?","co":"c1792582168784","cr":"ავთო","m":4,"v":2300,"e":29,"c":0,"w":6,"l":"https://facebook.com/reel/1262881025833338/","n":""},{"id":"v1792658296388","t":"კორპუსის მომსახურების გადასახადის გადახდა","co":"c1792582168784","cr":"ავთო","m":4,"v":1100,"e":33,"c":4,"w":9,"l":"https://facebook.com/reel/1678762136659547/","n":""},{"id":"v1792658748048","t":"ლობი","co":"c1792582168784","cr":"საბა","m":4,"v":8900,"e":102,"c":5,"w":6,"l":"https://facebook.com/reel/1280736470807491/","n":""},{"id":"v1792658892074","t":"ბაზარზე არის ერთ ცუდი ტრენდი","co":"c1792582168784","cr":"საბა","m":4,"v":19700,"e":854,"c":29,"w":6,"l":"https://facebook.com/reel/2036062070645720/","n":""},{"id":"v1792658950704","t":"რატომ არის რემონტის დაწყება შეზღუდული ბინის ჩაბარებამდე?","co":"c1792582168784","cr":"საბა","m":4,"v":4100,"e":63,"c":2,"w":14,"l":"https://facebook.com/reel/1005754829072802/","n":""},{"id":"v1792658994191","t":"საკუთარი ლობი - ეს არ არის ფუფუნება","co":"c1792582168784","cr":"საბა","m":4,"v":17500,"e":598,"c":17,"w":6,"l":"https://facebook.com/reel/1797259441250151/","n":""},{"id":"v1792661091720","t":"რატომ ღირს ძველი აშენებული ბინის შეძენა იმაზე ძვირი","co":"c1792582168784","cr":"საბა","m":5,"v":19100,"e":602,"c":21,"w":5,"l":"https://facebook.com/reel/1655518692442029/","n":""},{"id":"v1792661151636","t":"როგორ დავგეგმოთ რემონტი მეზობლების შეწუხების გარეშე?","co":"c1792582168784","cr":"ავთო","m":5,"v":2300,"e":42,"c":6,"w":9,"l":"https://facebook.com/reel/1491880098596890/","n":""},{"id":"v1792661249957","t":"როგორ შევარჩიოთ რეალურად კომფორტული საცხოვრებელი?","co":"c1792582168784","cr":"საბა","m":5,"v":1400,"e":24,"c":0,"w":4,"l":"https://facebook.com/reel/1000340989075591/","n":""},{"id":"v1792661291871","t":"ნუ იყიდი ბინას, სანამ ჩვენს პირობებს არ გაეცნობი!","co":"c1792582168784","cr":"საბა","m":5,"v":10300,"e":49,"c":0,"w":10,"l":"https://facebook.com/reel/1579889290805375/","n":""},{"id":"v1792661349406","t":"გინდა ერთიანად გადაიხადო?","co":"c1792582168784","cr":"საბა","m":5,"v":9000,"e":226,"c":11,"w":4,"l":"https://facebook.com/reel/1812064716430200/","n":""},{"id":"v1792661866510","t":"იურისტის რჩევები","co":"c1792582168784","cr":"თაკო იურისტი","m":5,"v":2200,"e":55,"c":12,"w":9,"l":"https://facebook.com/reel/983587197985472/","n":""},{"id":"v1792662063366","t":"ყველაზე ძვირი შეცდომა","co":"c1792582168784","cr":"თაკო იურისტი","m":5,"v":1200,"e":19,"c":0,"w":9,"l":"https://facebook.com/reel/978999391581836/","n":""},{"id":"v1792662134943","t":"იურისტის რჩევები","co":"c1792582168784","cr":"თაკო იურისტი","m":5,"v":1200,"e":25,"c":2,"w":5,"l":"https://facebook.com/reel/2080107342569472/","n":""},{"id":"v1792662217264","t":"როგორ მივიღოთ სახელმწიფოსგან იპოთეკის თანადაფინანსება?","co":"c1792582168784","cr":"ავთო","m":5,"v":4100,"e":99,"c":32,"w":11,"l":"https://facebook.com/reel/27713754158242659/","n":""},{"id":"v1792662393740","t":"ხარჯი თუ ჭკვიანური აქტივი?","co":"c1792582168784","cr":"გრეტა","m":5,"v":1400,"e":22,"c":0,"w":5,"l":"https://facebook.com/reel/1642294853549091/","n":""},{"id":"v1792662582756","t":"ბიზნესი, რომელიც რეკლამას არ საჭიროებს","co":"c1792582168784","cr":"ავთო","m":5,"v":1300,"e":53,"c":16,"w":6,"l":"https://facebook.com/reel/1028919756337589/","n":""},{"id":"v1792662812835","t":"კვ.მ 905$-ად (ეკვ.ლარში)","co":"c1792582168784","cr":"ავთო","m":5,"v":417300,"e":2500,"c":504,"w":7,"l":"https://facebook.com/reel/1960628721321532/","n":""},{"id":"v1792663102484","t":"რატომ ექცევა განსაკუთრებული ყურადღება სამუშაო საათებს სამშენებლო ობიექტზე?","co":"c1792582168784","cr":"თაკო იურისტი","m":5,"v":1400,"e":29,"c":4,"w":5,"l":"https://facebook.com/reel/4315927418646489/","n":""},{"id":"v1792663274627","t":"შეიძინე ბინა კვ.მ 905$-ად (ეკვ.ლარში)","co":"c1792582168784","cr":"საბა","m":5,"v":3200,"e":129,"c":14,"w":9,"l":"https://facebook.com/reel/1774468353535705/","n":""},{"id":"v1792663610872","t":"ირას ინტერვიუ","co":"c1792582168784","cr":"","m":5,"v":101100,"e":508,"c":30,"w":11,"l":"https://facebook.com/reel/1669161277709915/","n":""},{"id":"v1792663817838","t":"შეიძინეთ ბინა თქვენი პირობებით.","co":"c1792582168784","cr":"საბა","m":5,"v":5800,"e":232,"c":82,"w":18,"l":"https://facebook.com/reel/27513742788278848/","n":""},{"id":"v1792663963518","t":"კომერციული","co":"c1792582168784","cr":"AI","m":5,"v":2300,"e":20,"c":2,"w":2,"l":"https://facebook.com/reel/1893598141824830/","n":""},{"id":"v1792664033733","t":"ზოგი გემო ყველას გვაერთიანებს","co":"c1792582168784","cr":"AI","m":5,"v":2400,"e":19,"c":2,"w":3,"l":"https://facebook.com/reel/1000090896346012/","n":""},{"id":"v1792664137606","t":"ბიზნესს სჭირდება სწორი ადგილი","co":"c1792582168784","cr":"AI","m":5,"v":3000,"e":13,"c":0,"w":3,"l":"https://facebook.com/reel/1261919219187678/","n":""},{"id":"v1792664194791","t":"შეიძინე ბინა კვ.მ 905$-ად (ეკვ.ლარში)","co":"c1792582168784","cr":"ავთო","m":5,"v":43200,"e":932,"c":196,"w":2,"l":"https://facebook.com/reel/1686513245735476/","n":""},{"id":"v1792666287800","t":"რანაირი წინასწარი შენატანი","co":"c1792582168784","cr":"ავთო","m":6,"v":135800,"e":3300,"c":2200,"w":7,"l":"https://facebook.com/reel/1499926337928109/","n":""},{"id":"v1792666435560","t":"5 ივლისს, კვირას","co":"c1792582168784","cr":"AI","m":6,"v":3300,"e":36,"c":6,"w":3,"l":"https://facebook.com/reel/5080061858895449/","n":""},{"id":"v1792666481459","t":"შეიძინე ბინა კვ.მ 905-ად","co":"c1792582168784","cr":"საბა","m":6,"v":3800,"e":55,"c":11,"w":10,"l":"https://facebook.com/reel/1726953805288710/","n":""},{"id":"v1792666555205","t":"ბინა წინასწარი შენატანის გარეშე - თვეში მხოლოდ 880 ლარად.","co":"c1792582168784","cr":"ავთო","m":6,"v":94400,"e":1300,"c":440,"w":6,"l":"https://facebook.com/reel/1749541019812710/","n":""},{"id":"v1792666649189","t":"რა ცვლის ცხოვრების ხარისხს თქვენს სადარბაზოში?","co":"c1792582168784","cr":"ავთო","m":6,"v":2800,"e":39,"c":4,"w":6,"l":"https://facebook.com/reel/1039291571933814/","n":""},{"id":"v1792666798610","t":"მართე შენი უძრავი ქონება მობილური ტელეფონით.","co":"c1792582168784","cr":"AI","m":6,"v":17000,"e":36,"c":1,"w":12,"l":"https://facebook.com/reel/917741094681150/","n":""},{"id":"v1792666849720","t":"28 000 მობინადრე","co":"c1792582168784","cr":"AI","m":6,"v":2500,"e":16,"c":0,"w":4,"l":"https://facebook.com/reel/2100385577582991/","n":""},{"id":"v1792666888021","t":"უძრავ ქონებაში ერთი სიტყვა ათასობით დოლარი ღირს.","co":"c1792582168784","cr":"საბა","m":6,"v":12900,"e":110,"c":14,"w":10,"l":"https://facebook.com/reel/2440705226426316/","n":""},{"id":"v1792666973351","t":"ილუზიაა იმის დაჯერება, რომ ყველა ბინა ერთნაირად ძვირდება.","co":"c1792582168784","cr":"საბა","m":6,"v":26400,"e":71,"c":8,"w":10,"l":"https://facebook.com/reel/1502921311043608/","n":""},{"id":"v1792667021804","t":"სხვა უბანი","co":"c1792582168784","cr":"საბა","m":6,"v":12300,"e":84,"c":4,"w":12,"l":"https://facebook.com/reel/3637779176370075/","n":""},{"id":"v1792667078569","t":"ყველაზე დამღლელი ბინის ძიების პროცესი","co":"c1792582168784","cr":"საბა","m":6,"v":18900,"e":107,"c":6,"w":9,"l":"https://facebook.com/reel/1541499460798152/","n":""},{"id":"v1792667592906","t":"სანამ თქვენ კომენტარებში კითხულობთ, „რეალურია თუ არა","co":"c1792582168784","cr":"საბა","m":6,"v":34300,"e":400,"c":112,"w":13,"l":"https://facebook.com/reel/1510103896995972/","n":""},{"id":"v1792667765829","t":"იურისტის რჩევები","co":"c1792582168784","cr":"თაკო იურისტი","m":6,"v":1100,"e":35,"c":6,"w":5,"l":"https://facebook.com/reel/1663774851378869/","n":""},{"id":"v1792667928875","t":"წარმოიდგინეთ: იყიდეთ ფართი ბიზნესისთვის","co":"c1792582168784","cr":"თაკო იურისტი","m":6,"v":1500,"e":26,"c":0,"w":5,"l":"https://facebook.com/reel/2092240201368179/","n":""},{"id":"v1792668068959","t":"„შავი“, „თეთრი“ თუ „მწვანე“ კარკასი?","co":"c1792582168784","cr":"თაკო იურისტი","m":6,"v":1800,"e":29,"c":5,"w":7,"l":"https://facebook.com/reel/1373918967651084/","n":""},{"id":"v1792668257595","t":"სხვისი ვალი რომ არ შეგრჩეთ","co":"c1792582168784","cr":"თაკო იურისტი","m":6,"v":18300,"e":277,"c":7,"w":3,"l":"https://facebook.com/reel/1003740695830452/","n":""},{"id":"v1792668421194","t":"ბინა წინასწარი შენატანის გარეშე","co":"c1792582168784","cr":"ავთო","m":6,"v":79200,"e":849,"c":234,"w":8,"l":"https://facebook.com/reel/1813847833329450/","n":""},{"id":"v1792668519520","t":"სხვა უბანში\" #6 კორპუსი უკვე დასრულებულია.","co":"c1792582168784","cr":"საბა","m":6,"v":44000,"e":77,"c":9,"w":8,"l":"https://facebook.com/reel/2495037284297658/","n":""},{"id":"v1793000769038","t":"ფულს აგროვებ ბინის საწყისი შენატანისთვის?","co":"c1792582168784","cr":"საბა","m":7,"v":2500,"e":70,"c":13,"w":7,"l":"https://facebook.com/reel/2064897047439393/","n":""},{"id":"v1793000814802","t":"შეიძინე ბინა კვ.მ 905-ად - დიდ დიღომში.","co":"c1792582168784","cr":"ავთო","m":7,"v":131700,"e":939,"c":170,"w":4,"l":"https://facebook.com/reel/2114949209397805/","n":""},{"id":"v1793000855806","t":"ბინა ზუსტად 2 მეტროს შორის","co":"c1792582168784","cr":"საბა","m":7,"v":14700,"e":444,"c":48,"w":5,"l":"https://facebook.com/reel/2090445781868448/","n":""},{"id":"v1793000891672","t":"#6 კორპუსი უკვე დასრულებულია.","co":"c1792582168784","cr":"ავთო","m":7,"v":3700,"e":117,"c":72,"w":7,"l":"https://facebook.com/reel/1586245249757274/","n":""},{"id":"v1793000940312","t":"დეველოპერს ეს კითხვა აუცილებლად დაუსვი!","co":"c1792582168784","cr":"საბა","m":7,"v":13600,"e":279,"c":2,"w":3,"l":"https://facebook.com/reel/1047332821427295/","n":""},{"id":"v1793000972093","t":"მართე შენი უძრავი ქონება მხოლოდ ერთი აპლიკაციით!","co":"c1792582168784","cr":"საბა","m":7,"v":1300,"e":31,"c":2,"w":8,"l":"https://facebook.com/reel/1356325019987247/","n":""},{"id":"v1793001007088","t":"სტუდენტისთვის ბინა გჭირდება?","co":"c1792582168784","cr":"ავთო","m":7,"v":3500,"e":126,"c":65,"w":8,"l":"https://facebook.com/reel/1775765957084815/","n":""},{"id":"v1793001046744","t":"შეიძინე ბინა კვ.მ 905-ად - დიდ დიღომში.","co":"c1792582168784","cr":"ავთო","m":7,"v":2800,"e":84,"c":46,"w":9,"l":"https://facebook.com/reel/1767042514432977/","n":""},{"id":"v1793001477782","t":"დაზოგე 60 000 ლარამდე","co":"c1792582168784","cr":"ავთო","m":7,"v":4100,"e":120,"c":61,"w":11,"l":"https://facebook.com/reel/1344447161073782/","n":""},{"id":"v1793001724518","t":"ბინა წინასწარი შენატანის გარეშე თბილისში!","co":"c1792582168784","cr":"ავთო","m":7,"v":13200,"e":562,"c":338,"w":9,"l":"https://facebook.com/reel/1360737622926475/","n":""},{"id":"v1793001949831","t":"დაზოგე 50 000 ლარამდე - შეიძინე ბინა გლდანში.","co":"c1792582168784","cr":"საბა","m":7,"v":32100,"e":1000,"c":420,"w":19,"l":"https://facebook.com/reel/808921552282422/","n":""},{"id":"v1793002129234","t":"დაზოგე 60 000 ლარამდე","co":"c1792582168784","cr":"საბა","m":7,"v":2500,"e":50,"c":9,"w":12,"l":"https://facebook.com/reel/1459281892926040/","n":""},{"id":"v1793002504562","t":"დაზოგე 25 000 ლარამდე.","co":"c1792582168784","cr":"ავთო","m":7,"v":10400,"e":344,"c":192,"w":11,"l":"https://facebook.com/reel/1608059627616390/","n":""},{"id":"v1793002576618","t":"კვ.მ 1100-ის ნაცვლად მხოლოდ 905-ად!","co":"c1792582168784","cr":"ავთო","m":7,"v":50600,"e":428,"c":218,"w":8,"l":"https://facebook.com/reel/1397686142549291/","n":""},{"id":"v1793002725570","t":"დაზოგე 50 000 ლარზე მეტი","co":"c1792582168784","cr":"ავთო","m":7,"v":170000,"e":4200,"c":89,"w":2,"l":"https://facebook.com/reel/844707768631477/","n":""},{"id":"v1793003034152","t":"ბინა დასრულებულ კორპუსში","co":"c1792582168784","cr":"ავთო","m":7,"v":5600,"e":174,"c":110,"w":9,"l":"https://facebook.com/reel/1433543142039503/","n":""},{"id":"v1793003137631","t":"თბილისის ცენტრიდან 15 წუთში, კრწანისში","co":"c1792582168784","cr":"ავთო","m":7,"v":70900,"e":534,"c":152,"w":12,"l":"https://facebook.com/reel/39053063200959056/","n":""},{"id":"v1793003259358","t":"კვ.მ 1100-ის ნაცვლად, მხოლოდ 905-ად.","co":"c1792582168784","cr":"ავთო","m":7,"v":136600,"e":3600,"c":49,"w":2,"l":"https://facebook.com/reel/2151723935437107/","n":""},{"id":"v1793007530135","t":"შეიძინე თანამედროვე ვილა კრწანისში","co":"c1792582168784","cr":"ავთო","m":8,"v":27300,"e":985,"c":10,"w":5,"l":"https://facebook.com/reel/1376250377419597/","n":""},{"id":"v1793007923187","t":"არ იყიდო ბინა","co":"c1792582168784","cr":"ავთო","m":8,"v":58700,"e":2100,"c":80,"w":2,"l":"https://facebook.com/reel/1662246832187833/","n":""},{"id":"v1793008497194","t":"დასრულებული საცხოვრებელი კომპლექსი სანზონაში.","co":"c1792582168784","cr":"ავთო","m":8,"v":2600,"e":115,"c":80,"w":9,"l":"https://facebook.com/reel/1620664699407686/","n":""},{"id":"v1793008659640","t":"28 000 ადამიანი შენი ბიზნესის კართან","co":"c1792582168784","cr":"საბა","m":8,"v":1300,"e":14,"c":2,"w":6,"l":"https://facebook.com/reel/1012948481772569/","n":""},{"id":"v1793008836768","t":"იდეალური ადგილმდებარეობა ბიზნესისთვის","co":"c1792582168784","cr":"საბა","m":8,"v":1400,"e":35,"c":11,"w":7,"l":"https://facebook.com/reel/1816003729557406/","n":""},{"id":"v1793009148345","t":"ბინა დიდ დიღომში, დასრულებულ კორპუსში","co":"c1792582168784","cr":"ავთო","m":8,"v":2100,"e":44,"c":8,"w":6,"l":"https://facebook.com/reel/1599773851533552/","n":""},{"id":"v1793009231258","t":"მეტი სივრცე ნიშნავს მეტ კომფორტს","co":"c1792582168784","cr":"ავთო","m":8,"v":4300,"e":154,"c":74,"w":13,"l":"https://facebook.com/reel/1792217135284708/","n":""},{"id":"v1793010924932","t":"შეიძინე ორსართულიანი ვილა და მიიღე 2 ავტოსადგომი საჩუქრად.","co":"c1792582168784","cr":"ავთო","m":8,"v":1200,"e":32,"c":12,"w":7,"l":"https://facebook.com/reel/1436950821712488/","n":""},{"id":"v1793010964931","t":"28,000 გარანტირებული მომხმარებელი შენი ბიზნესისთვის","co":"c1792582168784","cr":"საბა","m":8,"v":95700,"e":78,"c":10,"w":8,"l":"https://facebook.com/reel/1128502586518675/","n":""},{"id":"v1793011069578","t":"შეიძინე ბინა 57 მ²-დან - ორი საძინებლით.","co":"c1792582168784","cr":"ავთო","m":8,"v":1600,"e":58,"c":18,"w":9,"l":"https://facebook.com/reel/1385223213804702/","n":""},{"id":"v1793011104039","t":"ლიფტის გადასახადს იხდი?","co":"c1792582168784","cr":"თაკო იურისტი","m":8,"v":2300,"e":27,"c":2,"w":9,"l":"https://facebook.com/reel/3743141659197467/","n":""},{"id":"v1793011142092","t":"კვ.მ მხოლოდ 775-ად","co":"c1792582168784","cr":"ავთო","m":8,"v":13200,"e":384,"c":260,"w":13,"l":"https://facebook.com/reel/1382024760749482/","n":""},{"id":"v1793011176343","t":"დაარეზერვე სასურველი ბინა დღესვე","co":"c1792582168784","cr":"საბა","m":8,"v":15500,"e":468,"c":25,"w":5,"l":"https://facebook.com/reel/1574274296959493/","n":""},{"id":"v1793011209569","t":"კერძო სახლი - ყიდვა თუ აშენება?","co":"c1792582168784","cr":"საბა","m":8,"v":14900,"e":418,"c":17,"w":7,"l":"https://facebook.com/reel/1728087794935097/","n":""},{"id":"v1793011243996","t":"დაიწყე ბიზნესი იქ, სადაც 28 000 მობინადრე გელოდება!","co":"c1792582168784","cr":"ავთო","m":8,"v":1800,"e":31,"c":2,"w":9,"l":"https://facebook.com/reel/1878902029745825/","n":""},{"id":"v1793011284350","t":"კერძო სახლი კორპუსში - კვ.მ მხოლოდ 890-ად.","co":"c1792582168784","cr":"ავთო","m":8,"v":56000,"e":2100,"c":397,"w":10,"l":"https://facebook.com/reel/1403371688659723/","n":""},{"id":"v1793011321319","t":"ბინა დასრულებულ პროექტში კვ.მ 1050-ად","co":"c1792582168784","cr":"ავთო","m":8,"v":32000,"e":1400,"c":116,"w":9,"l":"https://facebook.com/reel/1801253357964629/","n":""},{"id":"v1793011355602","t":"აი ფასი, რომელსაც პირდაპირ არასდროს გეუბნებიან!","co":"c1792582168784","cr":"საბა","m":8,"v":12000,"e":221,"c":97,"w":20,"l":"https://facebook.com/reel/1848543782982503/","n":""},{"id":"v1793011388386","t":"გარემონტებული დუპლექსი დიდ დიღომში","co":"c1792582168784","cr":"ავთო","m":8,"v":14500,"e":691,"c":91,"w":7,"l":"https://facebook.com/reel/1081784537908333/","n":""},{"id":"v1793011434860","t":"ბინა თბილისში 865 ლარად!","co":"c1792582168784","cr":"AI","m":8,"v":51000,"e":2500,"c":810,"w":5,"l":"https://facebook.com/reel/1648551933549533/","n":""},{"id":"v1793011475847","t":"შეიძინე ბინა თვეში მხოლოდ 550 ლარად","co":"c1792582168784","cr":"ავთო","m":8,"v":27200,"e":663,"c":336,"w":11,"l":"https://facebook.com/reel/28812744311683935/","n":""},{"id":"v1793011558915","t":"დასრულებული ბინა წინასწარი შენატანის გარეშე","co":"c1792582168784","cr":"საბა","m":9,"v":11500,"e":321,"c":70,"w":18,"l":"https://facebook.com/reel/1796224461571387/","n":""},{"id":"v1793011588931","t":"სხვენს ან სარდაფს ყიდულობ?","co":"c1792582168784","cr":"თაკო იურისტი","m":9,"v":1200,"e":17,"c":1,"w":6,"l":"https://facebook.com/reel/2519470885231382/","n":""},{"id":"v1793011621242","t":"ნახე, როგორ შეგიძლია ბინა დღესვე მხოლოდ 500-ად დაჯავშნო","co":"c1792582168784","cr":"საბა","m":9,"v":2300,"e":57,"c":26,"w":8,"l":"https://facebook.com/reel/1127820910200748/","n":""},{"id":"v1793011654464","t":"რატომ ღირს ერთსა და იმავე ადგილას ბინა 1000 და 1250","co":"c1792582168784","cr":"საბა","m":9,"v":4000,"e":40,"c":4,"w":13,"l":"https://facebook.com/reel/2637243626697136/","n":""},{"id":"v1793011686507","t":"რა პირობებით იყიდა 512-მა ადამიანმა ბინა დიდ დიღომში?","co":"c1792582168784","cr":"საბა","m":9,"v":2000,"e":72,"c":47,"w":8,"l":"https://facebook.com/reel/1822757845544930/","n":""},{"id":"v1793011723852","t":"ბინის ყიდვას თუ გეგმავ, ამ ვიდეოს ბოლომდე უყურე.","co":"c1792582168784","cr":"ავთო","m":9,"v":3300,"e":79,"c":24,"w":7,"l":"https://facebook.com/reel/1643761343944122/","n":""},{"id":"v1793011766446","t":"ბინა დიდ დიღომში - თვეში 550 ლარად!","co":"c1792582168784","cr":"AI","m":9,"v":48700,"e":946,"c":88,"w":3,"l":"https://facebook.com/reel/1614552676974265/","n":""},{"id":"v1793011801939","t":"თუ თვეში 865 ლარის გადახდა შეგიძლია ვიდეოს ბოლომდე უყურე.","co":"c1792582168784","cr":"ავთო","m":9,"v":3700,"e":86,"c":25,"w":11,"l":"https://facebook.com/reel/1657245876030830/","n":""},{"id":"v1793011829912","t":"ინფლაცია და შენი დანაზოგი","co":"c1792582168784","cr":"საბა","m":9,"v":906,"e":12,"c":2,"w":5,"l":"https://facebook.com/reel/4619833034968773/","n":""},{"id":"v1793011864717","t":"გახდი ბინის მესაკუთრე - 𝟏𝟗 𝟖𝟔𝟓 ლარად თბილისში!","co":"c1792582168784","cr":"AI","m":9,"v":16900,"e":621,"c":112,"w":4,"l":"https://facebook.com/reel/1755210148926524/","n":""},{"id":"v1793011900591","t":"ბინის შეძენისას მოგების პოტენციალი","co":"c1792582168784","cr":"საბა","m":9,"v":1000,"e":12,"c":2,"w":6,"l":"https://facebook.com/reel/1623605962881548/","n":""},{"id":"v1793011931811","t":"მოასწარი, სანამ ფასი შეიცვლება.","co":"c1792582168784","cr":"ავთო","m":9,"v":1100,"e":29,"c":4,"w":5,"l":"https://facebook.com/reel/1676227397260503/","n":""},{"id":"v1793011960439","t":"1350 თუ 1050 - შენ რომელს ირჩევ?","co":"c1792582168784","cr":"ავთო","m":9,"v":1500,"e":54,"c":24,"w":9,"l":"https://facebook.com/reel/1078082668460227/","n":""},{"id":"v1793011990061","t":"გახდი ბინის მესაკუთრე - 𝟏𝟗 𝟖𝟔𝟓 ლარად","co":"c1792582168784","cr":"AI","m":9,"v":1000,"e":31,"c":12,"w":7,"l":"https://facebook.com/reel/2193861784833039/","n":""},{"id":"v1793012033503","t":"ბინა 29 500 ლარად! • თბილისიდან 15 წუთში","co":"c1792582168784","cr":"AI","m":9,"v":40800,"e":1200,"c":603,"w":10,"l":"https://facebook.com/reel/1790309982120682/","n":""},{"id":"v1793012063049","t":"500-ზე მეტმა მობინადრემ უკვე ისარგებლა","co":"c1792582168784","cr":"ავთო","m":9,"v":1600,"e":25,"c":1,"w":7,"l":"https://facebook.com/reel/2151766405549174/","n":""},{"id":"v1793012106959","t":"შენი მეზობელი მტერი რატომ უნდა გახდეს?","co":"c1792582168784","cr":"ავთო","m":9,"v":1200,"e":17,"c":1,"w":9,"l":"https://facebook.com/reel/2515066025641798/","n":""},{"id":"v1793012140491","t":"ბინა დიდ დიღომში - თვეში მხოლოდ 550 ლარად!","co":"c1792582168784","cr":"AI","m":9,"v":893,"e":10,"c":0,"w":2,"l":"https://facebook.com/reel/1621948409305987/","n":""},{"id":"v1793012171491","t":"კვ.მ მხოლოდ 𝟕𝟕𝟓-ად","co":"c1792582168784","cr":"საბა","m":9,"v":1800,"e":22,"c":4,"w":8,"l":"https://facebook.com/reel/2844347689273363/","n":""},{"id":"v1793012201251","t":"ბინა 57 კვ.მ-დან - ორი საძინებლით","co":"c1792582168784","cr":"საბა","m":9,"v":3400,"e":87,"c":46,"w":10,"l":"https://facebook.com/reel/2003326047023918/","n":""},{"id":"v1793012236107","t":"ბინას ყიდულობ?","co":"c1792582168784","cr":"ავთო","m":9,"v":1700,"e":35,"c":0,"w":14,"l":"https://facebook.com/reel/1085130731027035/","n":""},{"id":"v1793012265292","t":"დაიწყე ბიზნესი იქ, სადაც 28 000 მომხმარებელი გელოდება!","co":"c1792582168784","cr":"ავთო","m":9,"v":878,"e":29,"c":4,"w":7,"l":"https://facebook.com/reel/979902234540810/","n":""},{"id":"v1793012380035","t":"შეიძინე ბინა კვ.მ 905-ად","co":"c1792582168784","cr":"AI","m":9,"v":375,"e":14,"c":4,"w":5,"l":"https://facebook.com/reel/1625979775748768/","n":""},{"id":"v1793012427393","t":"შენი ბიზნესი უკვე წარმატებული","co":"c1792582168784","cr":"საბა","m":9,"v":721,"e":7,"c":0,"w":7,"l":"https://facebook.com/reel/1641976404245474/","n":""},{"id":"v1793012454205","t":"ბინა ქალაქში საუკეთესო ფასად!","co":"c1792582168784","cr":"AI","m":9,"v":1000,"e":12,"c":4,"w":4,"l":"https://facebook.com/reel/1145970755041241/","n":""},{"id":"v1793013491932","t":"შეიძინე პენტჰაუსი \"სხვა კარკასის\" კონდიციით","co":"c1791875754866","cr":"AI","m":9,"v":5752,"e":113,"c":3,"w":4,"l":"https://www.facebook.com/reel/1848416393249955","n":""},{"id":"v1793013601121","t":"ჩვენს ხელებს ხედავ ტრანსპორტში","co":"c1791875754866","cr":"AI","m":9,"v":4241,"e":24,"c":1,"w":7,"l":"https://www.facebook.com/reel/2575997186241634","n":""},{"id":"v1793017060875","t":"მოიგე 100$ კვ.მ.-ზე ყიდვის წამიდან.","co":"c1793016823827","cr":"AI","m":0,"v":5379,"e":34,"c":8,"w":11,"l":"https://www.facebook.com/reel/848870191445778","n":""},{"id":"v1793017180851","t":"დაზოგე 100$ ყოველ კვადრატულ მეტრზე!","co":"c1793016823827","cr":"გრეტა","m":0,"v":6828,"e":41,"c":6,"w":14,"l":"https://www.facebook.com/reel/1210362427712147","n":""},{"id":"v1793017265353","t":"შეიძინე ბინა თბილისში თვეში მხოლოდ 865 ლარად!","co":"c1793016823827","cr":"გრეტა","m":0,"v":27700,"e":201,"c":58,"w":17,"l":"https://facebook.com/reel/4226420737685837/","n":""},{"id":"v1793017372798","t":"გაიცანით - ეს სოლაა! 🤖","co":"c1793016823827","cr":"სოლა AI","m":1,"v":9493,"e":330,"c":31,"w":3,"l":"https://www.facebook.com/reel/889174267372548","n":""},{"id":"v1793017408017","t":"ძირძველი უბნის ახალი სიცოცხლე - გლდანში","co":"c1793016823827","cr":"AI","m":1,"v":8000,"e":252,"c":61,"w":7,"l":"https://facebook.com/reel/1967389670541752/","n":""},{"id":"v1793017448047","t":"იცხოვრე იქ, საიდანაც ყველგან მარტივად მოხვდები.","co":"c1793016823827","cr":"სოლა AI","m":1,"v":57335,"e":145,"c":8,"w":6,"l":"https://www.facebook.com/reel/1615091619986283","n":""},{"id":"v1793017503037","t":"შეიძინე ბინა თვეში მხოლოდ 865 ლარად!","co":"c1793016823827","cr":"გრეტა","m":1,"v":30096,"e":270,"c":44,"w":9,"l":"https://www.facebook.com/reel/2118553538896211","n":""},{"id":"v1793017681929","t":"უკვე გაზაფხულია","co":"c1793016823827","cr":"სოლა AI","m":1,"v":28629,"e":150,"c":13,"w":6,"l":"https://www.facebook.com/reel/1224464783180330","n":""},{"id":"v1793018074708","t":"შეიძინე ბინა თბილისში თვეში - მხოლოდ 865 ლარად.","co":"c1793016823827","cr":"AI","m":2,"v":40882,"e":361,"c":45,"w":3,"l":"https://www.facebook.com/reel/1725897118819425","n":""},{"id":"v1793018214612","t":"შეიძინე ბინა თბილისში - თვეში მხოლოდ 865 ლარად!","co":"c1793016823827","cr":"სოლა AI","m":2,"v":24396,"e":270,"c":28,"w":6,"l":"https://www.facebook.com/reel/1244190647256083","n":""},{"id":"v1793018269362","t":"ბინა თბილისში, თვეში მხოლოდ 865 ლარად!","co":"c1793016823827","cr":"გრეტა","m":2,"v":27713,"e":379,"c":54,"w":7,"l":"https://www.facebook.com/reel/1999831794268132","n":""},{"id":"v1793018339673","t":"თბილისში ბინის შეძენა ასეთი მარტივი არასოდეს ყოფილა.","co":"c1793016823827","cr":"AI","m":2,"v":12149,"e":139,"c":22,"w":6,"l":"https://www.facebook.com/reel/1841772469835248","n":""},{"id":"v1793018391320","t":"დაბრუნდი იქ, სადაც ყოფნა გიხარია.","co":"c1793016823827","cr":"სოლა AI","m":2,"v":18426,"e":98,"c":10,"w":6,"l":"https://www.facebook.com/reel/3419839591515305","n":""},{"id":"v1793018471549","t":"სოლას დახმარებით შენ შეძლებ","co":"c1793016823827","cr":"სოლა AI","m":2,"v":5042,"e":52,"c":17,"w":5,"l":"https://www.facebook.com/reel/1951609649576679","n":""},{"id":"v1793018567059","t":"Solum Development გლდანში","co":"c1793016823827","cr":"AI","m":3,"v":16081,"e":98,"c":30,"w":0,"l":"https://www.facebook.com/reel/1312701717433525","n":""},{"id":"v1793018604088","t":"ბინების 96.5% უკვე გაყიდულია!","co":"c1793016823827","cr":"AI","m":3,"v":14100,"e":638,"c":10,"w":3,"l":"https://www.facebook.com/reel/847125494365423","n":""},{"id":"v1793018639750","t":"ბინების 98% უკვე გაყიდულია!","co":"c1793016823827","cr":"გრეტა","m":3,"v":14473,"e":815,"c":6,"w":4,"l":"https://www.facebook.com/reel/959626993600145","n":""},{"id":"v1793018718239","t":"\"Solum Development\" ფონიჭალა ქმნის ენერგოეფექტურ საცხოვრებელ გარემოს","co":"c1793016823827","cr":"სოლა AI","m":4,"v":2902,"e":22,"c":0,"w":2,"l":"https://www.facebook.com/reel/1549062629893103","n":""},{"id":"v1793018779621","t":"ისარგებლე სუბსიდირების პროგრამით","co":"c1793016823827","cr":"გრეტა","m":4,"v":100858,"e":955,"c":55,"w":11,"l":"https://www.facebook.com/reel/1582978010014598","n":""},{"id":"v1793018860282","t":"როდესაც გარემო გიწყობს ხელს","co":"c1793016823827","cr":"AI","m":4,"v":20234,"e":81,"c":5,"w":6,"l":"https://www.facebook.com/reel/1445918183952945","n":""},{"id":"v1793018914579","t":"შენი სახლის მდებარეობა ზრდის ან ამცირებს შენს ყოველდღიურ ხარჯებს.","co":"c1793016823827","cr":"სოლა AI","m":4,"v":3365,"e":50,"c":12,"w":4,"l":"https://www.facebook.com/reel/4508940122668817","n":""},{"id":"v1793018993745","t":"ყველა კითხვის პასუხი ერთ სივრცეში","co":"c1793016823827","cr":"სოლა AI","m":5,"v":10367,"e":301,"c":9,"w":2,"l":"https://www.facebook.com/reel/988795847239675","n":""},{"id":"v1793019032263","t":"სოლუმ დეველოპმენტმა\" ფონიჭალაში უბანს ახალი სიცოცხლე აჩუქა.","co":"c1793016823827","cr":"AI","m":5,"v":6388,"e":447,"c":12,"w":4,"l":"https://www.facebook.com/reel/3167490370308463","n":""},{"id":"v1793020572459","t":"შეიძინე ბინა კვ.მ 775-ად. 💸","co":"c1793016823827","cr":"გრეტა","m":6,"v":18908,"e":978,"c":459,"w":6,"l":"https://www.facebook.com/reel/1558115445896405","n":""},{"id":"v1793020664483","t":"შეიძინე ბინა თბილისში საუკეთესო ფასად!","co":"c1793016823827","cr":"AI","m":6,"v":34300,"e":660,"c":155,"w":7,"l":"https://facebook.com/reel/2642053779597918/","n":""},{"id":"v1793020739515","t":"ჩვენი ცხოვრების ყველა მნიშვნელოვანი მომენტი","co":"c1793016823827","cr":"AI","m":6,"v":11878,"e":363,"c":2,"w":2,"l":"https://www.facebook.com/reel/1723333818682519","n":""},{"id":"v1793020779473","t":"\"Solum Development\"-მა დეველოპერული საქმიანობა 2016 წლიდან დაიწყო.","co":"c1793016823827","cr":"სოლა AI","m":6,"v":11225,"e":221,"c":29,"w":3,"l":"https://www.facebook.com/reel/2294677311279377","n":""},{"id":"v1793020821942","t":"\"Solum Development\" ფონიჭალაში ბუნებასთან სიახლოვე მარტივია.","co":"c1793016823827","cr":"AI","m":6,"v":34700,"e":62,"c":2,"w":8,"l":"https://facebook.com/reel/1031388893068068/","n":""},{"id":"v1793020885327","t":"ბინა თბილისში - თვეში 865 ლარად!","co":"c1793016823827","cr":"AI","m":6,"v":79767,"e":1497,"c":619,"w":8,"l":"https://www.facebook.com/reel/1017585664491269","n":""},{"id":"v1793020927331","t":"ბინა თბილისში - თვეში 865 ლარად!","co":"c1793016823827","cr":"AI","m":6,"v":46040,"e":606,"c":139,"w":8,"l":"https://www.facebook.com/reel/1564221231821072","n":""},{"id":"v1793020981957","t":"შენ ყოველთვის იცი - რომელ ამბავს მოყვება გაგრძელება","co":"c1793016823827","cr":"AI","m":6,"v":21514,"e":318,"c":5,"w":9,"l":"https://www.facebook.com/reel/1811884429615799","n":""},{"id":"v1793021028142","t":"ბინა თბილისში - თვეში 865 ლარად!","co":"c1793016823827","cr":"AI","m":6,"v":53643,"e":749,"c":121,"w":4,"l":"https://www.facebook.com/reel/1567072385057945","n":""},{"id":"v1793021602385","t":"ბინა თბილისში - წინასწარი შენატანის გარეშე!","co":"c1793016823827","cr":"AI","m":7,"v":23623,"e":315,"c":11,"w":2,"l":"https://www.facebook.com/reel/1060516523173234","n":""},{"id":"v1793021742014","t":"დარჩენილია მხოლოდ 7 ბინა!","co":"c1793016823827","cr":"AI","m":7,"v":38263,"e":801,"c":147,"w":8,"l":"https://www.facebook.com/reel/4175980906025255","n":""},{"id":"v1793021794311","t":"ბინა თბილისში თვეში 522 ლარად!","co":"c1793016823827","cr":"სოლა AI","m":7,"v":44297,"e":1324,"c":741,"w":8,"l":"https://www.facebook.com/reel/1573392724489150","n":""},{"id":"v1793021840247","t":"ბინა წინასწარი შენატანის გარეშე თბილისში!","co":"c1793016823827","cr":"AI","m":7,"v":29648,"e":977,"c":491,"w":6,"l":"https://www.facebook.com/reel/1551035869830442","n":""},{"id":"v1793021912968","t":"ბინა წინასწარი შენატანის გარეშე.","co":"c1793016823827","cr":"გრეტა","m":7,"v":13259,"e":416,"c":49,"w":3,"l":"https://www.facebook.com/reel/1690766265330941","n":""},{"id":"v1793021961019","t":"ბინა წინასწარი შენატანის გარეშე!","co":"c1793016823827","cr":"AI","m":7,"v":22200,"e":655,"c":172,"w":3,"l":"https://facebook.com/reel/4542018926117550/","n":""},{"id":"v1793022006536","t":"ბინა თბილისში შენი სტუდენტი შვილისთვის","co":"c1793016823827","cr":"AI","m":7,"v":26663,"e":830,"c":0,"w":3,"l":"https://www.facebook.com/reel/1583111353451575","n":""},{"id":"v1793022054168","t":"ბინა თბილისში 865 ლარად! ⤷ საუკეთესო შანსი","co":"c1793016823827","cr":"სოლა AI","m":7,"v":38950,"e":1971,"c":988,"w":6,"l":"https://www.facebook.com/reel/1843133096846481","n":""},{"id":"v1793022129726","t":"ვნების სიმძაფრე შენებაშია","co":"c1793016823827","cr":"AI","m":8,"v":21284,"e":731,"c":11,"w":2,"l":"https://fb.watch/v/3TMAahui3/","n":""},{"id":"v1793022164259","t":"შენი წარმატებული ბიზნესი იწყება სწორი ადგილმდებარეობით.","co":"c1793016823827","cr":"გრეტა","m":8,"v":41600,"e":1100,"c":8,"w":2,"l":"https://facebook.com/reel/1401838852040147/","n":""},{"id":"v1793022209675","t":"ორსაძინებლიანი ბინა წინასწარი შენატანის გარეშე","co":"c1793016823827","cr":"AI","m":8,"v":4868,"e":183,"c":121,"w":6,"l":"https://www.facebook.com/reel/1052827780699294","n":""},{"id":"v1793022241645","t":"ბინა თბილისში საუკეთესო ფასად - კვ.მ. მხოლოდ 775!","co":"c1793016823827","cr":"AI","m":8,"v":20700,"e":732,"c":47,"w":4,"l":"https://facebook.com/reel/1323710077491358/","n":""},{"id":"v1793022278059","t":"დუპლექსი - კერძო სახლის კონცეფცია კორპუსში","co":"c1793016823827","cr":"გრეტა","m":8,"v":15700,"e":499,"c":22,"w":4,"l":"https://facebook.com/reel/1350331770508510/","n":""},{"id":"v1793022324242","t":"ბინა თბილისში 865 ლარად! ⤷ საუკეთესო შანსი:","co":"c1793016823827","cr":"AI","m":8,"v":9963,"e":409,"c":276,"w":8,"l":"https://www.facebook.com/reel/1651617242992293","n":""},{"id":"v1793022361485","t":"დასრულებული პროექტი თბილისში!","co":"c1793016823827","cr":"AI","m":8,"v":41108,"e":802,"c":9,"w":2,"l":"https://www.facebook.com/reel/1466784465343400","n":""},{"id":"v1793022425823","t":"ევროპის ერთ-ერთი ულამაზესი ქალაქი,","co":"c1793016823827","cr":"AI","m":9,"v":20278,"e":2090,"c":41,"w":7,"l":"https://fb.watch/v/3QxgBNKTS/","n":""},{"id":"v1793022523357","t":"ეძებ ბინას თბილისში? ⤷ მაშინ დროა არჩევანი გააკეთო","co":"c1793016823827","cr":"AI","m":9,"v":104200,"e":3500,"c":1800,"w":6,"l":"https://facebook.com/reel/3257738227759266/","n":""},{"id":"v1793022570227","t":"ბინა ქალაქში საუკეთესო ფასად","co":"c1793016823827","cr":"AI","m":9,"v":39886,"e":1571,"c":476,"w":5,"l":"https://www.facebook.com/reel/1679082693783805","n":""},{"id":"v1793022605294","t":"მეტროდან 15 წუთში - ბინა თვეში 865 ლარად!","co":"c1793016823827","cr":"AI","m":9,"v":41117,"e":1256,"c":213,"w":5,"l":"https://www.facebook.com/reel/902496346133891","n":""},{"id":"v1793022651673","t":"გახდი ბინის მესაკუთრე - 19 865 ლარად თბილისში!","co":"c1793016823827","cr":"AI","m":9,"v":32700,"e":1200,"c":371,"w":6,"l":"https://facebook.com/reel/1590410516194779/","n":""},{"id":"v1793022691588","t":"გახდი ბინის მესაკუთრე - 19 865 ლარად.","co":"c1793016823827","cr":"AI","m":9,"v":17237,"e":599,"c":357,"w":8,"l":"https://www.facebook.com/reel/2966052800409349","n":""},{"id":"v1793022734105","t":"ბინა ქალაქში საუკეთესო ფასად","co":"c1793016823827","cr":"AI","m":9,"v":12208,"e":347,"c":40,"w":6,"l":"https://www.facebook.com/reel/1443221324405884","n":""},{"id":"v1793084796327","t":"საზაფხულო თავგადასავალი უნდა იყოს შთამბეჭდავი.","co":"c1793084740964","cr":"ალფიკო AI","m":0,"v":1100,"e":54,"c":12,"w":4,"l":"https://facebook.com/reel/2348607852250012/","n":""},{"id":"v1793084847512","t":"შენ გჭირდება ბინა ზღვაზე.","co":"c1793084740964","cr":"ალფიკო AI","m":1,"v":155,"e":27,"c":9,"w":5,"l":"https://facebook.com/reel/1591408142058334/","n":""},{"id":"v1793084896802","t":"დროა მოემზადო ზაფხულის საოცარი დღეებისთვის!","co":"c1793084740964","cr":"AI","m":1,"v":367,"e":16,"c":1,"w":4,"l":"https://facebook.com/reel/1403633798075618/","n":""},{"id":"v1793084939792","t":"შეკვეთილი არის მშვენიერების ათვლის წერტილი","co":"c1793084740964","cr":"AI","m":1,"v":736,"e":37,"c":7,"w":6,"l":"https://facebook.com/reel/907402155110684/","n":""},{"id":"v1793084982570","t":"შეკვეთილი მუდამ შეგახსენებს","co":"c1793084740964","cr":"AI","m":1,"v":538,"e":15,"c":1,"w":3,"l":"https://facebook.com/reel/763878876783473/","n":""},{"id":"v1793085034440","t":"სურნელი თუ ხმა - რა გიღვიძებს მოგონებებს?","co":"c1793084740964","cr":"AI","m":3,"v":239,"e":14,"c":2,"w":5,"l":"https://facebook.com/reel/1282185663868750/","n":""},{"id":"v1793085095622","t":"ქვიშიან სანაპიროზე თათების კვალს თუ გაყვები","co":"c1793084740964","cr":"AI","m":7,"v":201700,"e":8800,"c":49,"w":3,"l":"https://facebook.com/reel/1416337960365588/","n":""},{"id":"v1793085124326","t":"ნამდვილი დასვენება ჩვენს ერთგულ მეგობრებსაც სჭირდებათ.","co":"c1793084740964","cr":"AI","m":7,"v":604,"e":16,"c":2,"w":4,"l":"https://facebook.com/reel/1803435601023539/","n":""},{"id":"v1793085149191","t":"კარგი იყოს ყველაფერი ასე!","co":"c1793084740964","cr":"AI","m":7,"v":810,"e":23,"c":0,"w":5,"l":"https://facebook.com/reel/1329418905901590/","n":""},{"id":"v1793085177373","t":"ზღვაზე ვისვენებთ და თან ვგეგმავთ, რომ ამ ბინას გავაქირავებთ!","co":"c1793084740964","cr":"AI","m":7,"v":583,"e":22,"c":2,"w":6,"l":"https://facebook.com/reel/1077759758122641/","n":""},{"id":"v1793085208540","t":"დარჩენილია მხოლოდ 7 ბინა!","co":"c1793084740964","cr":"AI","m":8,"v":401,"e":16,"c":0,"w":7,"l":"https://facebook.com/reel/1780226719692201/","n":""},{"id":"v1793085317886","t":"როდესაც შენი სახლის ხედი - ჰორიზონტია.","co":"c1793085242977","cr":"AI","m":5,"v":2544,"e":59,"c":14,"w":5,"l":"https://www.facebook.com/reel/1009621038227364","n":""},{"id":"v1793085398799","t":"\"კრწანისი გრიფონი\" ცვლის შენი ცხოვრების სტილს.","co":"c1793085242977","cr":"AI","m":6,"v":9228,"e":48,"c":10,"w":8,"l":"https://www.facebook.com/reel/3401986513321342","n":""},{"id":"v1793085622093","t":"ცხოვრებაში დგება ეტაპი, როცა მხოლოდ საუკეთესოს ირჩევ ✓","co":"c1793085242977","cr":"ატია","m":6,"v":2460,"e":133,"c":39,"w":11,"l":"https://www.facebook.com/reel/1713505533107635","n":""},{"id":"v1793085661203","t":"ადგილი, რომელიც დაგიბრუნებს ნანატრ სიმშვიდეს.","co":"c1793085242977","cr":"AI","m":6,"v":1623,"e":26,"c":0,"w":5,"l":"https://www.facebook.com/reel/802387282901036","n":""},{"id":"v1793085705961","t":"\"კრწანისი გრიფონი\"","co":"c1793085242977","cr":"AI","m":6,"v":113148,"e":262,"c":0,"w":2,"l":"https://www.facebook.com/reel/2239540399954425","n":""},{"id":"v1793085761753","t":"ორსართულიანი ვილა - მხოლოდ 192 000-ად!","co":"c1793085242977","cr":"AI","m":8,"v":16544,"e":313,"c":4,"w":2,"l":"https://www.facebook.com/reel/1810493360131649","n":""},{"id":"v1793085837308","t":"15 წუთში თბილისიდან","co":"c1793085242977","cr":"ხატია პაიჭაძე","m":8,"v":3174,"e":94,"c":14,"w":8,"l":"https://www.facebook.com/reel/2883842028653172","n":""},{"id":"v1793085866985","t":"შეიძინე ორსაძინებლიანი ბინა კრწანისში - 57.3 კვ.მ-დან","co":"c1793085242977","cr":"AI","m":8,"v":1300,"e":17,"c":0,"w":4,"l":"https://facebook.com/reel/1078133725193197/","n":""},{"id":"v1793085900913","t":"აღმოაჩინე ყველაზე მნიშვნელოვანი - საკუთარ თავთან სიახლოვე","co":"c1793085242977","cr":"AI","m":8,"v":3517,"e":109,"c":4,"w":3,"l":"https://www.facebook.com/reel/4644807985738946","n":""},{"id":"v1793085955778","t":"გაასწარი ცხოვრებას 47 ნაბიჯით!","co":"c1793085242977","cr":"ხატია პაიჭაძე","m":9,"v":5795,"e":236,"c":3,"w":5,"l":"https://www.facebook.com/reel/1107704461909718","n":""},{"id":"v1793085998272","t":"\"კრწანისი გრიფონში\" კერძო სახლი არის ადგილი","co":"c1793085242977","cr":"AI","m":9,"v":8741,"e":448,"c":24,"w":7,"l":"https://www.facebook.com/reel/947424464648328","n":""},{"id":"v1793086045062","t":"ბინა 29 500 ლარად! • თბილისიდან 15 წუთში.","co":"c1793085242977","cr":"AI","m":9,"v":12125,"e":470,"c":103,"w":6,"l":"https://www.facebook.com/reel/956169584229293","n":""},{"id":"v1793086214181","t":"რატევანზე დილა არ იწყება მაღვიძარით - იწყება განწყობით.","co":"c1793086154020","cr":"AI","m":0,"v":220,"e":13,"c":0,"w":4,"l":"https://www.facebook.com/reel/1208799504564679","n":""},{"id":"v1793086259505","t":"კომფორტი მარტივად იგრძნობა","co":"c1793086154020","cr":"AI","m":1,"v":201,"e":13,"c":0,"w":4,"l":"https://fb.watch/v/4n-klvOSA/","n":""},{"id":"v1793086295239","t":"როდესაც მიჰყვები შენს სურვილებს, მაშინ აკეთებ სწორ არჩევანს.","co":"c1793086154020","cr":"AI","m":2,"v":288,"e":29,"c":2,"w":6,"l":"https://facebook.com/reel/1645390499840399/","n":""},{"id":"v1793086385006","t":"იპოვე შენი სიმშვიდის წერტილი სანზონაში","co":"c1793086154020","cr":"","m":2,"v":661,"e":16,"c":2,"w":5,"l":"https://facebook.com/reel/4418721621714989/","n":""},{"id":"v1793086480488","t":"საცხოვრებელი კომპლექსი მხოლოდ 36 მობინადრისთვის!","co":"c1793086154020","cr":"AI","m":8,"v":379,"e":23,"c":4,"w":8,"l":"https://fb.watch/v/3hMIb8vb9/","n":""}]}</script>
+<script>
+const SRC='<!doctype html>\n'+document.documentElement.outerHTML;
+const D=JSON.parse(document.getElementById('seed').textContent);
+const MS='იან თებ მარ აპრ მაი ივნ ივლ აგვ სექ ოქტ ნოე დეკ'.split(' '),MF='იანვარი თებერვალი მარტი აპრილი მაისი ივნისი ივლისი აგვისტო სექტემბერი ოქტომბერი ნოემბერი დეკემბერი'.split(' ');
+const MET={videos:'ვიდეოების რაოდენობა',views:'ნახვები',eng:'ჩართულობა',com:'კომენტარები',avg:'საშ. ყურება (წმ)'},MK=Object.keys(MET);
+const P={h:'<path d="M3 11l9-8 9 8v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/>',v:'<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10 9l5 3-5 3z"/>',u:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6M16 4.8a3.5 3.5 0 0 1 0 6.4M18 14.4c2.2.7 3.5 2.6 3.5 5.6"/>',b:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 7h2M13 7h2M9 11h2M13 11h2M10 21v-4h4v4"/>',s:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',l:'<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',e:'<path d="M4 20h4L19 9l-4-4L4 16z"/>',d:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',p:'<path d="M12 5v14M5 12h14"/>'};
+const ic=(p,s=17)=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+const TT={ov:['მიმოხილვა','კონტენტის ეფექტიანობის ძირითადი მაჩვენებლები'],vd:['ვიდეო კონტენტი','ყველა ვიდეო დეტალური მაჩვენებლებით'],cr:['კრეატორები','კონტენტ კრეატორების შედეგები და შედარება'],co:['კომპანიები','თვიური მაჩვენებლები კომპანიების მიხედვით'],ad:['კონტროლ პანელი','მონაცემების დამატება, რედაქტირება და წაშლა']};
+const U={qt:'',tab:'ov',co:'',m:'',cr:'',q:'',met:'views',sort:'v',dir:-1};let admin=false,art=null;try{admin=sessionStorage.cp=='1'}catch(e){}
+const PH='f05d2736d4b6d79a5674813f0eaed0b059d61950439d8526907774ffda789e20';
+async function sha(s){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+function cp(){if(admin){U.tab='ad';render();return}form('კონტროლ პანელი',[['p','პაროლი','password','']],o=>{sha(o.p).then(h=>{if(h==PH){admin=true;try{sessionStorage.cp='1'}catch(e){}U.tab='ad';render()}else note('არასწორი პაროლი')})})}
+function lock(){admin=false;try{sessionStorage.removeItem('cp')}catch(e){}U.tab='ov';render()}
+const $=s=>document.querySelector(s),sum=a=>a.reduce((x,y)=>x+(+y||0),0);
+const f=n=>Math.round(n||0).toLocaleString('en').replace(/,/g,' '),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ab=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e4?Math.round(n/1e3)+'K':n>=1e3?(n/1e3).toFixed(1)+'K':n;
+const cn=id=>D.companies.find(c=>c.id==id)?.name||'—';
+function norm(){}
+norm();
+
+function setD(n){D.companies=n.companies;D.videos=n.videos;D.creators=n.creators;norm()}
+const SEEDTXT=document.getElementById('seed').textContent;let SIG=0,DB=null;for(let i=0;i<SEEDTXT.length;i++)SIG=(SIG*31+SEEDTXT.charCodeAt(i))|0;
+try{const L=JSON.parse(localStorage.getItem('lm_data_blank')||'null');if(L&&L.sig===SIG&&L.d&&L.d.videos)setD(L.d)}catch(e){}
+function setStat(k,m){const b=$('#bar'),bb=$('#bb');b.hidden=false;clearTimeout(window.HT);bb.hidden=true;
+if(k=='draft'||k=='saving')$('#bt').textContent='ინახება…';
+else if(k=='saved'){$('#bt').textContent='შენახულია. ცვლილება ყველასთან განახლდა';window.HT=setTimeout(()=>b.hidden=true,2500)}
+else if(k=='err')$('#bt').textContent='ვერ შეინახა: '+(m=='not_granted'?'ცვლილების უფლება არ გაქვს':m);
+else{$('#bt').textContent=art?'ცვლილება შენახულია ამ ბრაუზერში. ყველასთვის გამოსაქვეყნებლად დააჭირე ღილაკს':'შენახულია ამ ბრაუზერში. ყველასთვის გასაზიარებლად ჩამოტვირთე ფაილი და ატვირთე GitHub-ზე';bb.hidden=false;bb.textContent=art?'გამოქვეყნება':'ჩამოტვირთვა'}}
+function touch(){clearTimeout(window.ST);setStat('draft');window.ST=setTimeout(persist,400)}
+async function persist(){try{localStorage.setItem('lm_data_blank',JSON.stringify({sig:SIG,d:D}))}catch(e){}
+if(!DB)return setStat('local');const w=Date.now();window.LASTW=w;try{setStat('saving');await DB.doc('app/state').set({json:JSON.stringify(D),t:w});setStat('saved')}catch(e){setStat('err',(e&&(e.code||e.message))||'')}}
+const cos=()=>D.companies.filter(c=>!U.co||c.id==U.co);
+const ser=k=>Array.from({length:12},(_,i)=>sum(cos().map(c=>c.monthly[k][i])));
+const inP=i=>(U.m===''||i==U.m)&&(U.qt===''||Math.floor(i/3)==U.qt),pS=s=>s.reduce((a,v,i)=>a+(inP(i)?(+v||0):0),0),PL=()=>U.qt!==''?(+U.qt+1)+' კვარტალი':U.m!==''?MF[U.m]:'წელი';
+const perSel=()=>`<select onchange="U.qt=this.value;U.m='';render()"><option value="">ყველა კვარტალი</option>${[0,1,2,3].map(i=>`<option value="${i}" ${String(U.qt)===String(i)?'selected':''}>${i+1} კვარტალი (${MS[i*3]}–${MS[i*3+2]})</option>`).join('')}</select><select onchange="U.m=this.value;U.qt='';render()"><option value="">ყველა თვე</option>${MF.map((m,i)=>`<option value="${i}" ${String(U.m)===String(i)?'selected':''}>${m}</option>`).join('')}</select>`;
+const filt=()=>D.videos.filter(v=>(!U.co||v.co==U.co)&&inP(v.m)&&(!U.cr||v.cr==U.cr)&&(!U.q||v.t.toLowerCase().includes(U.q.toLowerCase())));
+const sel=(k,opts,ph)=>`<select onchange="U.${k}=this.value;render()"><option value="">${ph}</option>${opts.map(o=>`<option value="${o[0]}" ${String(U[k])===String(o[0])?'selected':''}>${esc(o[1])}</option>`).join('')}</select>`;
+const crSel=()=>sel('cr',D.creators.map(x=>[x,x]),'ყველა კრეატორი');
+const fb=(m)=>`<div class="fl fb">${coSel()}${crSel()}${m?perSel():''}</div>`;
+const coSel=()=>sel('co',D.companies.map(c=>[c.id,c.name]),'ყველა კომპანია');
+let GI=0;const spark=a=>{const m=Math.max(1,...a),p=a.map((v,i)=>`${i*10},${26-v/m*24}`).join(' ');return `<svg viewBox="0 0 110 28" preserveAspectRatio="none"><polyline points="${p}" fill="none" stroke="var(--ac)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`};
+const VF=()=>D.videos.filter(v=>(!U.co||v.co==U.co)&&(!U.cr||v.cr==U.cr));
+const calc=L=>({videos:L.length,views:sum(L.map(v=>v.v)),eng:sum(L.map(v=>v.e)),com:sum(L.map(v=>v.c)),avg:L.length?sum(L.map(v=>v.w))/L.length:0});
+const fa=x=>(Math.round(x*10)/10).toFixed(1),FM=k=>k=='avg'?fa:f,FS=k=>k=='avg'?fa:ab;
+const msr=(k,L)=>Array.from({length:12},(_,i)=>calc(L.filter(v=>v.m==i))[k]),qvl=(k,L)=>[0,1,2,3].map(i=>calc(L.filter(v=>Math.floor(v.m/3)==i))[k]);
+function bars(a,s='',lb='ნახვები',fm=f,fs=ab){const mx=Math.max(1,...a);
+return '<div class="cc">'+a.map((v,i)=>{const p=i?a[i-1]:0,pc=p?(v-p)/p*100:null;return `<div class="cl ${(U.qt!==''?Math.floor(i/3)==U.qt:s!==''&&i==s)?'sl':''}" style="--p:${v/mx*100}" onclick="U.qt='';U.m=U.m==='${i}'?'':'${i}';render()"><div class="tt"><b>${MF[i]}</b><div class="tv">${v?fm(v):'მონაცემი არ არის'}</div><div class="sub2">${lb}</div>${pc!=null?`<div style="color:${pc>=0?'#34d399':'#f87171'};font-weight:600">${pc>=0?'▲ +':'▼ −'}${Math.abs(pc).toFixed(1)}% წინა თვესთან</div>`:''}${i?`<div class="sub2">წინა თვე: ${fm(p)}</div>`:''}${v?`<div class="sub2">მაქსიმუმის ${(v/mx*100).toFixed(0)}%</div>`:''}</div><div class="cb"><span class="cv">${v?fs(v):''}</span></div><span class="cm">${MS[i]}</span></div>`}).join('')+'<div class="ax">'+[1,.75,.5,.25,0].map(k=>`<i style="top:${(1-k)*100}%"><b>${fs(fs===ab?Math.round(mx*k):mx*k)}</b></i>`).join('')+'</div></div>'}
+function qbars(q,lb='ნახვები',cp=0,fm=f,fs=ab){const mx=Math.max(1,...q);
+return `<div class="qs ${cp?'cp':''}">`+q.map((v,i)=>{const p=i?q[i-1]:0,pc=p?(v-p)/p*100:null,u=pc>=0;
+return `<div class="qt ${U.qt!==''&&i==U.qt?'sl':''}" title="${i+1} კვარტალი (${MF[i*3]}–${MF[i*3+2]}) · ${lb}: ${fm(v)}${pc!=null?' · '+(u?'+':'−')+Math.abs(pc).toFixed(1)+'% წინა კვარტალთან':''}" onclick="U.m='';U.qt=U.qt==='${i}'?'':'${i}';render()"><div class="qh"><span>${i+1} კვარტალი</span>${pc!=null?`<em class="${u?'up':'dn'}">${u?'▲':'▼'} ${Math.abs(pc).toFixed(0)}%</em>`:''}</div><b>${v?(cp?fs(v):fm(v)):'—'}</b><div class="qb"><i style="width:${v/mx*100}%"></i></div></div>`}).join('')+'</div>'}
+const delta=(a,b)=>b?`<span class="${a>=b?'up':'dn'}">${a>=b?'▲':'▼'} ${Math.abs((a-b)/b*100).toFixed(0)}%</span>`:'';
+function nav(){const I=[['ov','მთავარი',P.h],['vd','ვიდეოები',P.v],['cr','კრეატორები',P.u],['co','კომპანიები',P.b]];$('#nav').innerHTML=`<div class="br"><span class="lg">L</span><div><b>Lemons Analytics</b><small>ვიდეო კონტენტი 2026</small></div></div><nav>`+I.map(x=>`<button class="ni ${U.tab==x[0]?'on':''}" onclick="${x[0]=='ov'?'home()':`U.tab='${x[0]}';window.scrollTo(0,0);render()`}">${ic(x[2],20)}<span>${x[1]}</span></button>`).join('')+`<button class="ni cp ${U.tab=='ad'?'on':''}" onclick="cp()">${ic(admin?P.s:P.l,20)}<span class="l1">კონტროლ პანელი</span><span class="l2">პანელი</span></button></nav>`}
+function vmc(V){if(U.m===''&&U.qt==='')return '';const k=U.vm||'v',nm={v:'ნახვები',e:'ჩართულობა',c:'კომენტარები'},mx=Math.max(1,...V.map(v=>v[k])),n=V.length;
+const head=`<div class="sh"><div><h2>${PL()} — გამოქვეყნებული ვიდეოები${U.co?' · '+esc(cn(U.co)):''}</h2><p>${n} ვიდეო · ჯამი ${f(sum(V.map(v=>v[k])))} (${nm[k].toLowerCase()}). ვიდეოზე დაჭერით ჩანს დეტალები.</p></div><div class="fl" style="margin:0">${Object.entries(nm).map(([x,l])=>`<button class="${k==x?'pr':''}" onclick="U.vm='${x}';render()">${l}</button>`).join('')}</div></div>`;
+if(!n)return `<div class="c">${head}<div class="sub">ამ პერიოდში ვიდეო არ არის დამატებული</div></div>`;
+const sel=V.find(v=>v.id==U.vs);
+return `<div class="c">${head}<div class="vw ${n>28?'ov':''}"><div class="cc vx" style="--n:${n};${n>28?'min-width:'+n*34+'px':''}">`+V.map((v,i)=>`<div class="cl ${v.id==U.vs?'sl':''} ${i<2?'ed1':''} ${i>=n-2&&n>3?'ed2':''}" style="--p:${v[k]/mx*100}" onclick="U.vs=U.vs=='${v.id}'?'':'${v.id}';render()"><div class="tt"><b>${esc(v.t)}</b><div class="sub2">${esc(cn(v.co))} · ${esc(v.cr||'—')}</div><div class="tv">${f(v[k])} <span style="font-size:12px;font-weight:500">${nm[k].toLowerCase()}</span></div><div class="sub2">ნახვა ${f(v.v)} · ჩართულობა ${f(v.e)}</div><div class="sub2">კომენტარი ${f(v.c)} · საშ. ყურება ${v.w} წმ</div>${v.n?`<div class="sub2">${esc(v.n)}</div>`:''}</div><div class="cb"><span class="cv">${ab(v[k])}</span></div><span class="cm">${esc(v.cr||'—')}</span></div>`).join('')+'<div class="ax">'+[1,.75,.5,.25,0].map(q=>`<i style="top:${(1-q)*100}%"><b>${ab(Math.round(mx*q))}</b></i>`).join('')+`</div></div></div>${sel?`<div style="margin-top:14px">${vcards([sel],admin)}</div>`:''}</div>`}
+function empty(){return `<div class="c"><h2>კეთილი იყოს შენი მობრძანება</h2><p class="sub" style="margin:-6px 0 14px">საიტი ცარიელია. დაიწყე ამ თანმიმდევრობით:</p><ol style="margin:0;padding-left:20px;line-height:2"><li>დააჭირე <b>კონტროლ პანელს</b> და შეიყვანე პაროლი</li><li>დაამატე <b>კომპანიები</b> და <b>კრეატორები</b></li><li>დაამატე <b>ვიდეოები</b> სტატისტიკით. ვიდეოების რაოდენობა, ნახვები, ჩართულობა, კომენტარები და საშუალო ყურება ავტომატურად დაითვლება</li></ol></div>`}
+function ov(){if(!D.companies.length)return empty();const V=filt(),VA=VF(),k=MK.includes(U.met)?U.met:'views',mi=U.m!==''?+U.m:-1,qi=U.qt!==''?+U.qt:-1;U.met=k;
+const cards=MK.map(x=>{const s=msr(x,VA),t=calc(V)[x];let d='';
+if(qi>=0){const q=qvl(x,VA);d=qi>0?delta(q[qi],q[qi-1]):''}else{const i=mi>=0?mi:s.reduce((a,v,j)=>VA.some(w=>w.m==j)?j:a,-1);d=i>0?delta(s[i],s[i-1]):''}
+return `<div class="k ${k==x?'on':''}" onclick="U.met='${x}';render()"><span>${MET[x]}</span><b>${FM(x)(t)}</b>${d||'<span>&nbsp;</span>'}${spark(s)}</div>`}).join('');
+return fb(1)+`<div class="g">${cards}</div><div class="c"><h2>${MET[k]} — თვეების მიხედვით${U.m===''&&U.qt===''?'':' · '+PL()}</h2>${bars(msr(k,VA),U.m,MET[k],FM(k),FS(k))}</div><div class="c"><h2 style="margin-bottom:10px">კვარტლების შედარება — ${MET[k]}</h2>${qbars(qvl(k,VA),MET[k],0,FM(k),FS(k))}</div>`+vmc(V)+`<div class="c ov"><h2>კომპანიების შედარება — (${U.m===''&&U.qt===''?'წლიური ჯამი':PL()})</h2><table><tr><th>კომპანია</th>${MK.map(x=>`<th>${MET[x]}</th>`).join('')}</tr>${D.companies.filter(c=>!U.co||c.id==U.co).map(c=>{const r=calc(V.filter(v=>v.co==c.id));return `<tr><td>${esc(c.name)}</td>${MK.map(x=>`<td>${FM(x)(r[x])}</td>`).join('')}</tr>`}).join('')}</table></div><div class="c ov"><h2>საუკეთესო 8 ვიდეო ნახვების მიხედვით</h2>${vtab(V.slice().sort((a,b)=>b.v-a.v).slice(0,8),false)}</div>`}
+function vtab(L,ed){return '<div class="dt">'+vtbl(L,ed)+'</div><div class="mb">'+vcards(L,ed)+'</div>'}
+function vcards(L,ed){return L.map(v=>`<div class="vc"><div class="vt">${esc(v.t)}</div><div class="sub">${esc(cn(v.co))} · ${esc(v.cr||'—')} · ${MF[v.m]}${v.n?' · '+esc(v.n):''}</div><div class="vs"><div><b>${ab(v.v)}</b>ნახვა</div><div><b>${f(v.e)}</b>ჩართულობა</div><div><b>${f(v.c)}</b>კომენტარი</div><div><b>${v.w}წ</b>საშ. დრო</div></div><div class="va">${/^https?:/.test(v.l)?`<a href="${esc(v.l)}" target="_blank" rel="noopener">ვიდეოს ნახვა</a>`:''}${ed?`<button class="ib" onclick="vf('${v.id}')">${ic(P.e)}</button><button class="ib x" onclick="vdel('${v.id}')">${ic(P.d)}</button>`:''}</div></div>`).join('')}
+function vtbl(L,ed){return `<table><tr>${[['t','სათაური'],['co','კომპანია'],['cr','კრეატორი'],['m','პერიოდი'],['v','ნახვები'],['e','ჩართულობა'],['c','კომენტარები'],['w','საშ. ყურება (წმ)']].map(h=>`<th onclick="U.sort='${h[0]}';U.dir=U.sort=='${h[0]}'&&U.dir==-1?1:-1;render()">${h[1]}</th>`).join('')}<th>ბმული</th>${ed?'<th></th>':''}</tr>`+L.map(v=>`<tr><td class="t" title="${esc(v.t)}">${esc(v.t)}${v.n?` <span class="sub">· ${esc(v.n)}</span>`:''}</td><td>${esc(cn(v.co))}</td><td>${esc(v.cr||'—')}</td><td>${MS[v.m]}</td><td>${f(v.v)}</td><td>${f(v.e)}</td><td>${f(v.c)}</td><td>${v.w}</td><td>${/^https?:/.test(v.l)?`<a href="${esc(v.l)}" target="_blank" rel="noopener">▶</a>`:''}</td>${ed?`<td><button class="ib" onclick="vf('${v.id}')">${ic(P.e)}</button> <button class="ib x" onclick="vdel('${v.id}')">${ic(P.d)}</button></td>`:''}</tr>`).join('')+'</table>'}
+function vd(){const L=filt(),s=U.sort,d=U.dir;L.sort((a,b)=>(typeof a[s]=='string'?a[s].localeCompare(b[s]):a[s]-b[s])*d);return `<div class="fl fb">${coSel()}${crSel()}${perSel()}<input placeholder="ძებნა სათაურით" value="${esc(U.q)}" oninput="U.q=this.value;clearTimeout(window.T);window.T=setTimeout(()=>{render();const i=document.querySelector('input[placeholder]');i.focus();i.setSelectionRange(99,99)},300)"><select onchange="U.sort=this.value;U.dir=-1;render()">${[['v','↓ ნახვები'],['e','↓ ენგეიჯმენტი'],['c','↓ კომენტარები'],['w','↓ საშ. წამი'],['m','↓ თვე'],['t','ა-ჰ სათაური']].map(o=>`<option value="${o[0]}" ${U.sort==o[0]?'selected':''}>${o[1]}</option>`).join('')}</select>${admin?'<button class="pr" onclick="vf()">ვიდეოს დამატება</button>':''}</div><div class="sub" style="margin-bottom:6px">${L.length} ვიდეო · ${f(sum(L.map(v=>v.v)))} ნახვა</div><div class="c ov">${vtab(L,admin)}</div>`}
+function cr(){const base=D.videos.filter(v=>!U.co||v.co==U.co),L0=D.creators.filter(n=>!U.cr||n==U.cr);return fb(1)+(L0.length?`<div class="cols">`+L0.map(n=>{const LA=base.filter(v=>v.cr==n),r=calc(LA.filter(v=>inP(v.m)));return `<div class="c"><h2>${esc(n)}</h2><div class="sub">${r.videos} ვიდეო · საშ. ${f(r.views/(r.videos||1))} ნახვა/ვიდეო · ჩართულობა ${f(r.eng)} · კომენტარები ${f(r.com)} · საშ. ყურება ${fa(r.avg)} წმ</div><b style="font-size:22px">${f(r.views)}</b> ნახვა${bars(msr('views',LA),U.m)}<div class="sub" style="margin:14px 0 8px">კვარტლების შედარება</div>${qbars(qvl('views',LA),'ნახვები',1)}</div>`}).join('')+'</div>':'<div class="c sub">კრეატორები ჯერ არ არის დამატებული</div>')}
+function co(){const k=MK.includes(U.met)?U.met:'views',F=FM(k);return `<div class="fl">${MK.map(x=>`<button class="${k==x?'pr':''}" onclick="U.met='${x}';render()">${MET[x]}</button>`).join('')}</div><div class="c ov"><table><tr><th>კომპანია</th>${MS.map(m=>`<th>${m}</th>`).join('')}<th>სულ</th></tr>`+D.companies.map(c=>{const L=D.videos.filter(v=>v.co==c.id),s=msr(k,L);return `<tr><td>${esc(c.name)}</td>${s.map((x,i)=>`<td>${L.some(v=>v.m==i)?F(x):'·'}${i&&x&&s[i-1]?'<br>'+delta(x,s[i-1]).replace('class','style="font-size:10px" class'):''}</td>`).join('')}<td><b>${F(calc(L)[k])}</b></td></tr>`}).join('')+'</table></div>'}
+function ad(){const ib=(c,fn,p)=>`<button class="ib ${c}" onclick="${fn}">${ic(p)}</button>`;
+return `<div class="fl"><span class="sub">ადმინისტრატორის რეჟიმი აქტიურია. ცვლილებები ინახება ღილაკით „შენახვა".</span><button onclick="lock()">გასვლა</button></div><div class="c"><div class="sh"><div><h2>ექსპორტი GitHub-ისთვის</h2><p>ჩამოტვირთავს index.html-ს ყველა ახლანდელი მონაცემით. ატვირთე GitHub-ზე ძველი ფაილის ნაცვლად.</p></div><button class="pr" onclick="exp()">${ic(P.p)} index.html-ის ჩამოტვირთვა</button></div></div>
+<div class="c"><div class="sh"><div><h2>კრეატორები</h2><p>დაამატე, გადაარქვი სახელი ან წაშალე კონტენტ კრეატორი</p></div><button class="pr" onclick="crf()">${ic(P.p)} დამატება</button></div><div>${D.creators.map((n,i)=>`<span class="chip">${esc(n)}<span class="sub">${D.videos.filter(v=>v.cr==n).length} ვიდეო</span>${ib('',`crf(${i})`,P.e)}${ib('x',`crdel(${i})`,P.d)}</span>`).join('')||'<span class="sub">კრეატორები არ არის</span>'}</div></div>
+<div class="c"><div class="sh"><div><h2>ვიდეო კონტენტი</h2><p>დაამატე ახალი ვიდეო ან შეცვალე და წაშალე არსებული</p></div><button class="pr" onclick="vf()">${ic(P.p)} ვიდეოს დამატება</button></div>${vd()}</div>
+<div class="sh"><div><h2>კომპანიები</h2><p>დაამატე, გადაარქვი სახელი ან წაშალე. სტატისტიკა ავტომატურად ითვლება ვიდეოებიდან</p></div><button class="pr" onclick="cof()">${ic(P.p)} კომპანიის დამატება</button></div>`+D.companies.map(c=>`<div class="c"><div class="sh"><input class="nm" value="${esc(c.name)}" onchange="D.companies.find(x=>x.id=='${c.id}').name=this.value;touch()"><button class="x" onclick="codel('${c.id}')">${ic(P.d)} წაშლა</button></div><div class="sub">${D.videos.filter(v=>v.co==c.id).length} ვიდეო</div></div>`).join('')}
+function ask(m,fn){$('#mdl').innerHTML=`<div class="md" onclick="if(event.target==this)this.remove()"><div><h2>${m}</h2><div class="fl" style="margin:16px 0 0"><button id="ok" style="background:var(--dn);border-color:var(--dn);color:#fff;font-weight:600">წაშლა</button><button onclick="$('#mdl').innerHTML=''">გაუქმება</button></div></div></div>`;$('#ok').onclick=()=>{$('#mdl').innerHTML='';fn()}}
+function note(m){$('#mdl').innerHTML=`<div class="md" onclick="if(event.target==this)this.remove()"><div><h2>${m}</h2><div class="fl" style="margin:16px 0 0"><button class="pr" onclick="$('#mdl').innerHTML=''">კარგი</button></div></div></div>`}
+function form(t,fs,ok){const fi=x=>x[2]=='h'?`<h3 class="fh">${x[1]}</h3>`:`<div class="fi ${x[5]=='h'?'half':''}"><label>${x[1]}${x[6]?` <span class="sub">· ${x[6]}</span>`:''}</label>${x[2]=='s'?`<select id="f_${x[0]}">${x[4].map(o=>`<option value="${o[0]}" ${String(o[0])==String(x[3])?'selected':''}>${esc(o[1])}</option>`).join('')}</select>`:`<input id="f_${x[0]}" type="${x[2]}" ${x[2]=='number'?'min="0" step="any" inputmode="decimal" placeholder="0"':''} value="${esc(x[3])}">`}</div>`;
+$('#mdl').innerHTML=`<div class="md" onclick="if(event.target==this)this.remove()"><div><h2>${t}</h2><div class="fr">${fs.map(fi).join('')}</div><div id="fe" class="sub" style="color:var(--dn);min-height:18px;margin-top:10px"></div><div class="fl" style="margin:6px 0 0"><button class="pr" id="ok">შენახვა</button><button onclick="$('#mdl').innerHTML=''">გაუქმება</button></div></div></div>`;document.querySelectorAll('#mdl input').forEach(i=>i.onkeydown=e=>{if(e.key=='Enter')$('#ok').click()});$('#ok').onclick=()=>{const o={};fs.forEach(x=>{if(x[2]!='h')o[x[0]]=$('#f_'+x[0]).value});const r=ok(o);if(typeof r=='string')$('#fe').textContent=r;else if(r!==false)$('#mdl').innerHTML=''}}
+function vf(id){if(!D.companies.length)return note('ჯერ დაამატე კომპანია: კონტროლ პანელი → კომპანიის დამატება');const v=D.videos.find(x=>x.id==id)||{co:U.co||D.companies[0].id,cr:U.cr,m:U.m!==''?+U.m:new Date().getMonth(),t:'',v:'',e:'',c:'',w:'',l:'',n:''};
+const S=[['v','ნახვები','სულ ნახვა'],['e','ჩართულობა','ჯამური ჩართულობა'],['c','კომენტარები','კომენტარების რაოდენობა'],['w','საშუალო ყურება (წმ)','საშუალო ყურების დრო წამებში']];
+form(id?'ვიდეოს რედაქტირება':'ახალი ვიდეო',[[0,'ძირითადი ინფორმაცია','h'],['t','ვიდეოს სათაური','text',v.t,0,'','მაგ. თარიღი ან თემა'],['co','კომპანია','s',v.co,D.companies.map(c=>[c.id,c.name]),'h'],['cr','კრეატორი','s',v.cr,[['','—'],...D.creators.map(x=>[x,x])],'h'],['m','პერიოდი (თვე)','s',v.m,MF.map((m,i)=>[i,m])],[0,'სტატისტიკა','h'],...S.map(s=>[s[0],s[1],'number',v[s[0]],0,'h',s[2]]),[0,'დამატებითი','h'],['l','ვიდეოს ბმული','url',v.l],['n','შენიშვნა','text',v.n]],o=>{if(!o.t.trim())return 'შეიყვანე ვიდეოს სათაური';for(const s of S){const x=o[s[0]];if(x===''||isNaN(+x))return 'შეავსე სტატისტიკა: '+s[1];if(+x<0)return s[1]+' არ შეიძლება იყოს უარყოფითი'}const r={id:id||'v'+Date.now(),t:o.t.trim(),co:o.co,cr:o.cr,m:+o.m,v:Math.round(+o.v),e:Math.round(+o.e),c:Math.round(+o.c),w:+(+o.w).toFixed(1),l:o.l.trim(),n:o.n.trim()};if(id)Object.assign(v,r);else D.videos.push(r);touch();render()})}
+const vdel=id=>{const v=D.videos.find(x=>x.id==id);ask('წაიშალოს ვიდეო „'+esc(v?v.t:'')+'"?',()=>{D.videos=D.videos.filter(v=>v.id!=id);U.vs='';touch();render()})};
+function crf(i){const o=i==null?'':D.creators[i];form(o?'კრეატორის რედაქტირება':'ახალი კრეატორი',[['n','სახელი და გვარი','text',o]],r=>{const n=r.n.trim();if(!n||D.creators.some((x,j)=>x==n&&j!=i))return false;if(o){D.videos.forEach(v=>{if(v.cr==o)v.cr=n});D.creators[i]=n}else D.creators.push(n);touch();render()})}
+const crdel=i=>ask('წაიშალოს კრეატორი „'+esc(D.creators[i])+'"? მისი ვიდეოები დარჩება.',()=>{D.creators.splice(i,1);touch();render()});
+function cof(){form('ახალი კომპანია',[['n','დასახელება','text','']],o=>{if(!o.n.trim())return false;D.companies.push({id:'c'+Date.now(),name:o.n.trim(),monthly:{}});norm();touch();render()})}
+const codel=id=>ask('წაიშალოს კომპანია „'+esc(cn(id))+'" და მისი ყველა ვიდეო?',()=>{D.companies=D.companies.filter(c=>c.id!=id);D.videos=D.videos.filter(v=>v.co!=id);U.co='';touch();render()});
+function buildHtml(){const j=JSON.stringify(D).replace(/</g,'\\u003c');return SRC.replace(/(<script id="seed" type="application\/json">)[\s\S]*?(<\/script>)/,(_,a,b)=>a+j+b)}
+async function exp(){const h=buildHtml();let dl=null;try{dl=await claude.use('downloads')}catch(e){}
+if(dl){for(const n of ['index.html','index.html.txt']){try{await dl.save({filename:n,data:h});if(n!='index.html')note('ფაილი ჩამოიტვირთა როგორც index.html.txt. GitHub-ზე ატვირთვამდე სახელი გადაარქვი: index.html');return}catch(e){const c=e&&e.code;if(c=='declined')return;if(c!='rejected_extension'&&c!='extension_not_enabled')return note('ჩამოტვირთვა ვერ მოხერხდა: '+(c||''))}}return}
+const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([h],{type:'text/html'}));a.download='index.html';a.click()}
+async function pub(){const j=JSON.stringify(D).replace(/</g,'\\u003c');const h=SRC.replace(/(<script id="seed" type="application\/json">)[\s\S]*?(<\/script>)/,(_,a,b)=>a+j+b);if(!art){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([h],{type:'text/html'}));a.download='index.html';a.click();$('#bar').hidden=true;return note('ფაილი ჩამოიტვირთა. ატვირთე GitHub-ზე და ჩაანაცვლე index.html')}try{await art.publish(h)}catch(e){if(e&&e.code!='conflict')note('ვერ შეინახა: '+(e.message||e.code))}}
+function home(){Object.assign(U,{qt:'',vs:'',vm:'v',tab:'ov',co:'',m:'',cr:'',q:'',met:'views',sort:'v',dir:-1});$('#mdl').innerHTML='';window.scrollTo(0,0);render()}
+function render(){if(U.tab=='ad'&&!admin)U.tab='ov';nav();$('#ph').innerHTML=`<h1>${TT[U.tab][0]}</h1><p>${TT[U.tab][1]}</p>`;$('#app').innerHTML={ov,vd,cr,co,ad}[U.tab]()}
+render();
+(async()=>{try{art=await claude.use('artifact');try{DB=await claude.use('db');if(DB)DB.doc('app/state').onSnapshot(s=>{if(!s.exists)return;const x=s.data();if(x&&x.json&&x.t!==window.LASTW){try{setD(JSON.parse(x.json));render()}catch(e){}}},()=>{})}catch(e){}}catch(e){}render()})();
+</script></body></html>
